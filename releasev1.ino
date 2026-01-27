@@ -1,21 +1,25 @@
-#include <SPI.h>
+#include <SPI.h> 
 #include <SD.h>
 #include <WiFi.h>
 #include <time.h>
-#include <HardwareSerial.h>     // ✅ ADDED
+#include <HardwareSerial.h>
 #include "driver/i2s.h"
-#include <math.h>
+#include <math.h> 
+#include <WebServer.h>
+
 
 // ================= WIFI & TIME =================
-const char* ssid = "HUAWEI-2.4G-Y66f";
-const char* password = "AuKN4N4w";
+const char* apSSID = "ESP32_NOISE_MONITOR";
+const char* apPassword = "12345678";
 
 // Philippines timezone (UTC +8)
 #define GMT_OFFSET_SEC   (8 * 3600)
 #define DAYLIGHT_OFFSET  0
 
+WebServer server(80);
+
 // ================= MP3 PLAYER =================
-HardwareSerial mp3(2);          // ✅ ADDED (UART2)
+HardwareSerial mp3(2);
 
 // ================= PINS =================
 #define LED_GREEN   14
@@ -34,8 +38,8 @@ HardwareSerial mp3(2);          // ✅ ADDED (UART2)
 #define NOISE_FLOOR 25000
 #define SENSITIVITY 0.5
 
-#define YELLOW_THRESHOLD 65
-#define RED_THRESHOLD    70
+int yellowThreshold = 65;
+int redThreshold    = 70;
 
 #define HYSTERESIS_DB    3
 #define SMOOTH_ALPHA    0.1
@@ -71,6 +75,9 @@ unsigned long lastLogTime = 0;
 enum LedState { GREEN, YELLOW, RED };
 LedState currentState = GREEN;
 
+// Speaker toggle (AP mode)
+bool speakerEnabled = true;
+
 // ================= TIME STRING =================
 String getTimeString() {
   struct tm timeinfo;
@@ -83,7 +90,6 @@ String getTimeString() {
 }
 
 // ================= MP3 PLAY FUNCTION =================
-// ADDED — does NOT touch existing logic
 void playMP3(uint8_t track) {
   uint8_t selectTF[] = {0x7E, 0x03, 0x35, 0x01, 0xEF};
   uint8_t setVol[]   = {0x7E, 0x03, 0x31, 0x1E, 0xEF};
@@ -93,7 +99,7 @@ void playMP3(uint8_t track) {
   delay(200);
   mp3.write(setVol, sizeof(setVol));
   delay(200);
-  mp3.write(playCmd, sizeof(playCmd));
+  if(speakerEnabled) mp3.write(playCmd, sizeof(playCmd));
 }
 
 // ================= WAV RECORDING =================
@@ -139,7 +145,7 @@ bool recordINMP441Wav5s() {
   const uint32_t sampleRate = 16000;
   const uint16_t bitsPerSample = 16;
   const uint16_t channels = 1;
-  const uint32_t durationMs = 50000;
+  const uint32_t durationMs = 5000;
   const uint32_t totalSamples = (sampleRate * durationMs) / 1000;
   const uint32_t targetDataBytes = totalSamples * channels * (bitsPerSample / 8);
 
@@ -203,6 +209,33 @@ bool recordINMP441Wav5s() {
   return bytesWritten > 0;
 }
 
+// ================= WEB PAGE =================
+String generateHTML() {
+  String html = "<!DOCTYPE html><html><head><title>Noise Monitor</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'></head><body>";
+  html += "<h2>Noise Monitor Settings</h2>";
+  
+  html += "<form action='/update' method='POST'>";
+  html += "Yellow Threshold: <input type='range' name='yellow' min='0' max='120' value='" + String(yellowThreshold) + "' oninput='this.nextElementSibling.value = this.value'><output>" + String(yellowThreshold) + "</output><br>";
+  html += "Red Threshold: <input type='range' name='red' min='0' max='120' value='" + String(redThreshold) + "' oninput='this.nextElementSibling.value = this.value'><output>" + String(redThreshold) + "</output><br>";
+  html += "Speaker: <input type='checkbox' name='speaker' " + String(speakerEnabled ? "checked" : "") + "><br><br>";
+  html += "<input type='submit' value='Update'>";
+  html += "</form></body></html>";
+  return html;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", generateHTML());
+}
+
+void handleUpdate() {
+  if (server.hasArg("yellow")) yellowThreshold = server.arg("yellow").toInt();
+  if (server.hasArg("red")) redThreshold = server.arg("red").toInt();
+  speakerEnabled = server.hasArg("speaker");
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
@@ -215,22 +248,18 @@ void setup() {
   SPI.begin(18, 19, 23, SD_CS);
   SD.begin(SD_CS, SPI, 1000000);
 
-  // ===== WIFI CONNECT =====
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println(" connected");
+  // ===== AP MODE =====
+  WiFi.softAP(apSSID, apPassword);
+  Serial.println("AP Mode started. Connect to WiFi: " + String(apSSID));
+  Serial.println("IP: " + WiFi.softAPIP().toString());
 
-  // ===== TIME SYNC =====
-  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, "pool.ntp.org", "time.nist.gov");
-  Serial.println("Time synchronized");
+  server.on("/", handleRoot);
+  server.on("/update", handleUpdate);
+  server.begin();
 
-  // ===== MP3 INIT (BOOT WAIT) =====  ADDED
-  delay(8000);                              // MP3 boot time
-  mp3.begin(9600, SERIAL_8N1, 16, 17);      // RX, TX
+  // ===== MP3 INIT =====
+  delay(8000);
+  mp3.begin(9600, SERIAL_8N1, 16, 17);
 
   // ===== I2S SETUP =====
   i2s_config_t i2s_config = {
@@ -260,6 +289,8 @@ void setup() {
 
 // ================= LOOP =================
 void loop() {
+  server.handleClient();
+
   unsigned long now = millis();
 
   rawDB = readMicDB();
@@ -321,19 +352,19 @@ int getMovingAverage(int value) {
 void updateLEDState(int value) {
   switch (currentState) {
     case GREEN:
-      if (value > YELLOW_THRESHOLD + HYSTERESIS_DB)
+      if (value > yellowThreshold + HYSTERESIS_DB)
         currentState = YELLOW;
       break;
 
     case YELLOW:
-      if (value > RED_THRESHOLD + HYSTERESIS_DB)
+      if (value > redThreshold + HYSTERESIS_DB)
         currentState = RED;
-      else if (value < YELLOW_THRESHOLD - HYSTERESIS_DB)
+      else if (value < yellowThreshold - HYSTERESIS_DB)
         currentState = GREEN;
       break;
 
     case RED:
-      if (value < RED_THRESHOLD - HYSTERESIS_DB)
+      if (value < redThreshold - HYSTERESIS_DB)
         currentState = YELLOW;
       break;
   }
@@ -345,7 +376,7 @@ void updateLEDState(int value) {
 
 // ================= WARNING LOGIC =================
 void handleRedWarnings(int value, unsigned long now) {
-  if (value >= RED_THRESHOLD) {
+  if (value >= redThreshold) {
     if (redStartTime == 0) {
       redStartTime = now;
       firstLogged = secondLogged = majorLogged = false;
@@ -354,18 +385,18 @@ void handleRedWarnings(int value, unsigned long now) {
     unsigned long d = now - redStartTime;
     if (d >= FIRST_WARNING_TIME && !firstLogged) {
       logEvent("FIRST WARNING (RED 5s)");
-      playMP3(0x01);     // 001.mp3
+      playMP3(0x01);
       firstLogged = true;
     }
     if (d >= SECOND_WARNING_TIME && !secondLogged) {
       logEvent("SECOND WARNING (RED 30s)");
-      playMP3(0x02);     // 002.mp3
+      playMP3(0x02);
       secondLogged = true;
     }
     if (d >= MAJOR_WARNING_TIME && !majorLogged) {
       logEvent("MAJOR WARNING (RED 60s)");
       recordINMP441Wav5s();
-      playMP3(0x03);     // 003.mp3
+      playMP3(0x03);
       majorLogged = true;
     }
   } else {
