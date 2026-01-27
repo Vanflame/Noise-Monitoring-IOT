@@ -260,19 +260,9 @@ void connectToWiFi() {
 
 // ================= HTML PAGE =================
 void handleRoot() {
-  String html = "<html><head><title>ESP32 LED Control</title>";
+  String html = "<html><head><title>ESP32 NOISE CONFIGURATION</title>";
   html += "<style>body { font-family: Arial; text-align: center; margin-top: 30px; }";
   html += "input[type=range] { width: 60%; margin: 15px; }</style></head><body>";
-
-  html += "<h1>ESP32 LED Control</h1>";
-  html += "<p>LED Brightness: " + String(ledBrightness) + "</p>";
-  html += "<form action=\"/setLED\" method=\"get\">";
-  html += "<input type=\"range\" min=\"0\" max=\"255\" name=\"value\" value=\"" + String(ledBrightness) + "\" onchange=\"this.form.submit()\">";
-  html += "</form>";
-
-  html += "<form action=\"/toggleLED\" method=\"get\">";
-  html += "<button type=\"submit\">Toggle RED LED</button>";
-  html += "</form>";
 
   html += "<h2>Thresholds</h2>";
   html += "<form action=\"/setThresholds\" method=\"get\">";
