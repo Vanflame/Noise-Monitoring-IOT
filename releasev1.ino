@@ -5,14 +5,25 @@
 #include <HardwareSerial.h>     // ✅ ADDED
 #include "driver/i2s.h"
 #include <math.h>
+#include <WebServer.h>
+#include <Preferences.h>
 
 // ================= WIFI & TIME =================
-const char* ssid = "HUAWEI-2.4G-Y66f";
-const char* password = "AuKN4N4w";
+String networkSSID = "";
+String networkPassword = "";
 
-// Philippines timezone (UTC +8)
-#define GMT_OFFSET_SEC   (8 * 3600)
-#define DAYLIGHT_OFFSET  0
+// Wi-Fi connection tracking
+bool wifiConnecting = false;
+bool wifiConnected = false;
+unsigned long wifiStartTime = 0;
+const unsigned long WIFI_TIMEOUT = 15000; // 15 seconds
+String wifiStatusMessage = "Not connected";
+
+Preferences preferences;
+WebServer server(80);
+
+// ================= SPEAKER CONTROL =================
+bool speakerEnabled = true; // toggle flag
 
 // ================= MP3 PLAYER =================
 HardwareSerial mp3(2);          // ✅ ADDED (UART2)
@@ -34,8 +45,8 @@ HardwareSerial mp3(2);          // ✅ ADDED (UART2)
 #define NOISE_FLOOR 25000
 #define SENSITIVITY 0.5
 
-#define YELLOW_THRESHOLD 65
-#define RED_THRESHOLD    70
+int YELLOW_THRESHOLD = 65;
+int RED_THRESHOLD =70;
 
 #define HYSTERESIS_DB    3
 #define SMOOTH_ALPHA    0.1
@@ -56,6 +67,7 @@ int32_t samples[BUFFER_LEN];
 int rawDB = 0;
 double smoothDB = 0;
 int lastLoggedDB = -100;
+unsigned long lastLogTime = 0;
 
 int avgBuffer[AVG_WINDOW];
 int avgIndex = 0;
@@ -66,10 +78,10 @@ bool firstLogged = false;
 bool secondLogged = false;
 bool majorLogged = false;
 
-unsigned long lastLogTime = 0;
-
 enum LedState { GREEN, YELLOW, RED };
 LedState currentState = GREEN;
+
+int ledBrightness = 0;
 
 // ================= TIME STRING =================
 String getTimeString() {
@@ -83,8 +95,9 @@ String getTimeString() {
 }
 
 // ================= MP3 PLAY FUNCTION =================
-// ADDED — does NOT touch existing logic
 void playMP3(uint8_t track) {
+  if (!speakerEnabled) return; // skip if disabled
+
   uint8_t selectTF[] = {0x7E, 0x03, 0x35, 0x01, 0xEF};
   uint8_t setVol[]   = {0x7E, 0x03, 0x31, 0x1E, 0xEF};
   uint8_t playCmd[]  = {0x7E, 0x04, 0x42, 0x01, track, 0xEF};
@@ -203,86 +216,94 @@ bool recordINMP441Wav5s() {
   return bytesWritten > 0;
 }
 
-// ================= SETUP =================
-void setup() {
-  Serial.begin(115200);
-  delay(2000);
+// ================= WIFI HANDLERS =================
+void handleNetworkConnection() {
+  if (server.hasArg("ssid") && server.hasArg("password")) {
+    networkSSID = server.arg("ssid");
+    networkPassword = server.arg("password");
 
-  pinMode(LED_GREEN, OUTPUT);
-  pinMode(LED_YELLOW, OUTPUT);
-  pinMode(LED_RED, OUTPUT);
+    preferences.begin("wifi", false);
+    preferences.putString("ssid", networkSSID);
+    preferences.putString("password", networkPassword);
+    preferences.end();
 
-  SPI.begin(18, 19, 23, SD_CS);
-  SD.begin(SD_CS, SPI, 1000000);
-
-  // ===== WIFI CONNECT =====
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect(true);
     delay(500);
-    Serial.print(".");
+    WiFi.begin(networkSSID.c_str(), networkPassword.c_str());
+    wifiConnecting = true;
+    wifiConnected = false;
+    wifiStartTime = millis();
+    wifiStatusMessage = "Connecting to Wi-Fi...";
+    Serial.println("Saved credentials and connecting to new Wi-Fi");
+
+    server.send(200, "text/html", "<html><body>Saved! " + wifiStatusMessage + "</body></html>");
   }
-  Serial.println(" connected");
-
-  // ===== TIME SYNC =====
-  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, "pool.ntp.org", "time.nist.gov");
-  Serial.println("Time synchronized");
-
-  // ===== MP3 INIT (BOOT WAIT) =====  ADDED
-  delay(8000);                              // MP3 boot time
-  mp3.begin(9600, SERIAL_8N1, 16, 17);      // RX, TX
-
-  // ===== I2S SETUP =====
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = 16000,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = BUFFER_LEN,
-    .use_apll = false
-  };
-
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_SCK,
-    .ws_io_num = I2S_WS,
-    .data_out_num = -1,
-    .data_in_num = I2S_SD
-  };
-
-  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_PORT, &pin_config);
-
-  Serial.println("=== Stable Noise Monitoring System ===");
 }
 
-// ================= LOOP =================
-void loop() {
-  unsigned long now = millis();
+void connectToWiFi() {
+  preferences.begin("wifi", true);
+  networkSSID = preferences.getString("ssid", "");
+  networkPassword = preferences.getString("password", "");
+  preferences.end();
 
-  rawDB = readMicDB();
-  smoothDB = smoothDB + SMOOTH_ALPHA * (rawDB - smoothDB);
-  int avgDB = getMovingAverage((int)smoothDB);
+  if (networkSSID != "") {
+    Serial.print("Connecting to Wi-Fi: ");
+    Serial.println(networkSSID);
 
-  Serial.print("Raw: ");
-  Serial.print(rawDB);
-  Serial.print(" | Smooth: ");
-  Serial.println((int)smoothDB);
-
-  updateLEDState((int)smoothDB);
-  handleRedWarnings((int)smoothDB, now);
-
-  if ((now - lastLogTime >= LOG_INTERVAL_MS) &&
-      abs((int)smoothDB - lastLoggedDB) >= DB_CHANGE_LOG) {
-
-    logNoise((int)smoothDB);
-    lastLoggedDB = (int)smoothDB;
-    lastLogTime = now;
+    WiFi.begin(networkSSID.c_str(), networkPassword.c_str());
+    wifiConnecting = true;
+    wifiConnected = false;
+    wifiStartTime = millis();
+    wifiStatusMessage = "Connecting to Wi-Fi...";
   }
+}
 
-  delay(50);
+// ================= HTML PAGE =================
+void handleRoot() {
+  String html = "<html><head><title>ESP32 NOISE CONFIGURATION</title>";
+  html += "<style>body { font-family: Arial; text-align: center; margin-top: 30px; }";
+  html += "input[type=range] { width: 60%; margin: 15px; }</style></head><body>";
+
+  html += "<h2>Thresholds</h2>";
+  html += "<form action=\"/setThresholds\" method=\"get\">";
+  html += "Yellow Threshold: <input type=\"range\" min=\"0\" max=\"100\" name=\"yellow\" value=\"" + String(YELLOW_THRESHOLD) + "\" onchange=\"this.form.submit()\"><br>";
+  html += "Red Threshold: <input type=\"range\" min=\"0\" max=\"100\" name=\"red\" value=\"" + String(RED_THRESHOLD) + "\" onchange=\"this.form.submit()\"><br>";
+  html += "</form>";
+
+  html += "<h2>Speaker Control</h2>";
+  html += "<form action=\"/toggleSpeaker\" method=\"get\">";
+  html += "<button type=\"submit\">Toggle Speaker</button>";
+  html += "</form>";
+
+  html += "<h2>Configure Wi-Fi</h2>";
+  html += "<form action=\"/save\" method=\"POST\">";
+  html += "SSID: <input type=\"text\" name=\"ssid\"><br>";
+  html += "Password: <input type=\"password\" name=\"password\"><br>";
+  html += "<input type=\"submit\" value=\"Save\">";
+  html += "</form>";
+
+  html += "<p>Wi-Fi Status: " + wifiStatusMessage + "</p>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+// ===== New Handlers =====
+void handleSetThresholds() {
+  if (server.hasArg("yellow")) {
+    int y = server.arg("yellow").toInt();
+    YELLOW_THRESHOLD = constrain(y, 0, 100);
+  }
+  if (server.hasArg("red")) {
+    int r = server.arg("red").toInt();
+    RED_THRESHOLD = constrain(r, 0, 100);
+  }
+  server.send(200, "text/html", "<html><body>Thresholds updated!<br><a href='/'>Go back</a></body></html>");
+}
+
+void handleToggleSpeaker() {
+  speakerEnabled = !speakerEnabled;
+  server.send(200, "text/html", String("<html><body>Speaker ") + (speakerEnabled ? "Enabled" : "Disabled") + "<br><a href='/'>Go back</a></body></html>");
 }
 
 // ================= MIC =================
@@ -354,18 +375,18 @@ void handleRedWarnings(int value, unsigned long now) {
     unsigned long d = now - redStartTime;
     if (d >= FIRST_WARNING_TIME && !firstLogged) {
       logEvent("FIRST WARNING (RED 5s)");
-      playMP3(0x01);     // 001.mp3
+      playMP3(0x01);
       firstLogged = true;
     }
     if (d >= SECOND_WARNING_TIME && !secondLogged) {
       logEvent("SECOND WARNING (RED 30s)");
-      playMP3(0x02);     // 002.mp3
+      playMP3(0x02);
       secondLogged = true;
     }
     if (d >= MAJOR_WARNING_TIME && !majorLogged) {
       logEvent("MAJOR WARNING (RED 60s)");
       recordINMP441Wav5s();
-      playMP3(0x03);     // 003.mp3
+      playMP3(0x03);
       majorLogged = true;
     }
   } else {
@@ -406,4 +427,110 @@ void logEvent(const char* msg) {
     f.println(dbValue);
     f.close();
   }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+
+  // Start AP + STA
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP("ESP32_NOISE_Setup", "12345678", 1, false, 4);
+  Serial.println("AP started: ESP32_LED_Setup");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  delay(500);
+
+  connectToWiFi();
+
+  // Web server routes
+  server.on("/", handleRoot);
+  server.on("/save", handleNetworkConnection);
+  server.on("/setThresholds", handleSetThresholds);
+  server.on("/toggleSpeaker", handleToggleSpeaker);
+  server.begin();
+
+  SPI.begin(18, 19, 23, SD_CS);
+  SD.begin(SD_CS, SPI, 1000000);
+
+  // ===== I2S SETUP =====
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = 16000,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = BUFFER_LEN,
+    .use_apll = false
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = -1,
+    .data_in_num = I2S_SD
+  };
+
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pin_config);
+
+  // ===== MP3 INIT =====
+  delay(8000);
+  mp3.begin(9600, SERIAL_8N1, 16, 17);
+
+  // ===== TIME SYNC =====
+  configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+  Serial.println("=== Stable Noise Monitoring System ===");
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+
+  // Wi-Fi connection tracking
+  if (wifiConnecting) {
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      wifiConnecting = false;
+      wifiStatusMessage = "Connected! IP: " + WiFi.localIP().toString();
+      Serial.println(wifiStatusMessage);
+    } else if (millis() - wifiStartTime > WIFI_TIMEOUT) {
+      wifiConnected = false;
+      wifiConnecting = false;
+      wifiStatusMessage = "Connection failed or timed out";
+      Serial.println(wifiStatusMessage);
+    }
+  }
+
+  unsigned long now = millis();
+
+  rawDB = readMicDB();
+  smoothDB = smoothDB + SMOOTH_ALPHA * (rawDB - smoothDB);
+  int avgDB = getMovingAverage((int)smoothDB);
+
+  Serial.print("Raw: ");
+  Serial.print(rawDB);
+  Serial.print(" | Smooth: ");
+  Serial.println((int)smoothDB);
+
+  updateLEDState((int)smoothDB);
+  handleRedWarnings((int)smoothDB, now);
+
+  if ((now - lastLogTime >= LOG_INTERVAL_MS) &&
+      abs((int)smoothDB - lastLoggedDB) >= DB_CHANGE_LOG) {
+
+    logNoise((int)smoothDB);
+    lastLoggedDB = (int)smoothDB;
+    lastLogTime = now;
+  }
+
+  delay(50);
 }
