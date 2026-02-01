@@ -1,0 +1,548 @@
+#pragma once
+
+// Single-page UI served at '/'
+// Stored outside the .ino to avoid Arduino sketch preprocessor issues with raw string literals.
+static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32 Noise Monitor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { --bg:#0b1220; --card:#0f172a; --muted:#94a3b8; --text:#e5e7eb; --accent:#2563eb; --ok:#16a34a; --warn:#f59e0b; --bad:#dc2626; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: 'Segoe UI', Arial, sans-serif; background: linear-gradient(180deg,#0b1220,#060a13); color: var(--text); padding: 18px; }
+    .wrap { max-width: 520px; margin: 0 auto; }
+    .card { background: rgba(15,23,42,0.9); border: 1px solid rgba(148,163,184,0.15); border-radius: 14px; padding: 16px; margin-bottom: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.35); }
+    h1 { font-size: 20px; margin: 0 0 10px 0; }
+    h2 { font-size: 16px; margin: 0 0 10px 0; color: #cbd5e1; }
+    .row { display:flex; gap:10px; width: 100%; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+    .row-actions { justify-content: flex-start; }
+    .row-actions .btn { flex: 1 1 140px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .pill { display:inline-flex; gap:8px; align-items:center; padding: 6px 10px; border-radius: 999px; background: rgba(148,163,184,0.12); border: 1px solid rgba(148,163,184,0.18); font-size: 12px; }
+    .btn { background: var(--accent); color: white; border: none; padding: 10px 12px; border-radius: 10px; cursor: pointer; font-size: 14px; }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn.gray { background: rgba(148,163,184,0.22); }
+    input { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid rgba(148,163,184,0.25); background: rgba(2,6,23,0.6); color: var(--text); }
+    label { font-size: 12px; color: #cbd5e1; display:block; margin-bottom: 6px; }
+    .grid { display:grid; grid-template-columns: 1fr; gap: 10px; }
+    .list { display:flex; flex-direction:column; gap:8px; }
+    .net { display:flex; align-items:center; justify-content:space-between; gap:10px; padding: 10px; border-radius: 12px; border: 1px solid rgba(148,163,184,0.18); background: rgba(2,6,23,0.35); cursor: pointer; }
+    .net:hover { border-color: rgba(37,99,235,0.6); }
+    .right { display:flex; gap:8px; align-items:center; }
+    .badge { padding: 4px 8px; border-radius: 999px; font-size: 12px; }
+    .ok { background: rgba(22,163,74,0.22); border: 1px solid rgba(22,163,74,0.35); }
+    .bad { background: rgba(220,38,38,0.22); border: 1px solid rgba(220,38,38,0.35); }
+    .warn { background: rgba(245,158,11,0.22); border: 1px solid rgba(245,158,11,0.35); }
+    pre { background: rgba(2,6,23,0.55); border: 1px solid rgba(148,163,184,0.18); border-radius: 12px; padding: 10px; max-height: 180px; overflow:auto; font-size: 12px; white-space: pre-wrap; }
+    .hide { display:none; }
+    .topbar { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    .player { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding: 10px; border-radius: 12px; border: 1px solid rgba(148,163,184,0.18); background: rgba(2,6,23,0.35); }
+    .player .tracks { display:flex; gap:8px; flex-wrap:wrap; }
+    .player .meta { flex: 1 1 160px; }
+    .range { display:flex; align-items:center; gap:10px; width: 100%; }
+    input[type=range] { width: 100%; }
+    .logline { display:block; padding: 2px 0; }
+    .log-time { color: #86efac; }
+    .log-ok { color: #22c55e; }
+    .log-warn { color: #fbbf24; }
+    .log-bad { color: #f87171; }
+    .log-muted { color: rgba(148,163,184,0.9); }
+    .toast { position: fixed; left: 50%; transform: translateX(-50%); top: 12px; width: min(520px, calc(100% - 24px)); background: rgba(15,23,42,0.95); border: 1px solid rgba(37,99,235,0.55); border-radius: 14px; padding: 12px; box-shadow: 0 18px 40px rgba(0,0,0,0.5); display:none; z-index: 9999; }
+    .toast .title { font-weight: 800; margin-bottom: 6px; }
+    .toast .row { justify-content: flex-end; }
+    .spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.35); border-top-color: rgba(255,255,255,0.95); border-radius: 50%; display:inline-block; vertical-align: middle; animation: spin 0.9s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="topbar">
+        <div>
+          <h1 style="margin:0 0 6px 0;">ESP32 Noise Monitor</h1>
+          <div class="muted" id="subtitle">Loading...</div>
+        </div>
+        <button class="btn gray" id="topLogoutBtn">Logout</button>
+      </div>
+    </div>
+
+    <div class="card" id="loginCard">
+      <h2>Admin Login</h2>
+      <div class="grid">
+        <div>
+          <label>Email</label>
+          <input id="email" type="email" placeholder="admin@example.com" />
+        </div>
+        <div>
+          <label>Password</label>
+          <input id="password" type="password" placeholder="Your password" />
+        </div>
+        <div class="row row-actions">
+          <button class="btn" id="loginBtn">Login</button>
+          <button class="btn gray" id="logoutBtn">Logout</button>
+        </div>
+        <div class="muted" id="loginMsg"></div>
+      </div>
+    </div>
+
+    <div class="card" id="dashCard">
+      <div class="row">
+        <h2>Network</h2>
+        <div class="pill" id="netPill">...</div>
+      </div>
+      <div class="muted" id="netDetails">...</div>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn" id="scanBtn">Scan Wi-Fi</button>
+        <button class="btn gray" id="disconnectBtn">Disconnect</button>
+      </div>
+      <div class="list" id="netList" style="margin-top:10px;"></div>
+      <div class="muted" id="netMsg" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="card hide" id="controlsCard">
+      <h2>Admin Controls</h2>
+      <div class="grid">
+        <div>
+          <label>Yellow Threshold</label>
+          <input id="yellow" type="number" min="0" max="100" />
+        </div>
+        <div>
+          <label>Red Threshold</label>
+          <input id="red" type="number" min="0" max="100" />
+        </div>
+        <div class="row">
+          <button class="btn" id="saveThreshBtn">Save Thresholds</button>
+          <button class="btn gray" id="speakerBtn">Toggle Speaker</button>
+        </div>
+        <div class="pill" id="speakerPill">Speaker: ...</div>
+
+        <div>
+          <label>MP3 Player</label>
+          <div class="player">
+            <div class="meta">
+              <div style="font-weight:700;" id="mp3Now">Ready</div>
+              <div class="muted">Play warning tracks or stop</div>
+            </div>
+            <div class="range" style="flex: 1 1 220px;">
+              <div class="pill">Vol: <span id="volVal">30</span></div>
+              <input id="vol" type="range" min="0" max="30" step="1" value="30" />
+            </div>
+            <div class="tracks">
+              <button class="btn" id="mp3Play01">Play 01</button>
+              <button class="btn" id="mp3Play02">Play 02</button>
+              <button class="btn" id="mp3Play03">Play 03</button>
+              <button class="btn gray" id="mp3Stop">Stop</button>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <label>Live Monitor</label>
+          <pre id="monitor">Loading...</pre>
+        </div>
+        <div class="muted" id="ctrlMsg"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Logs</h2>
+      <pre id="events">Loading...</pre>
+    </div>
+  </div>
+
+  <div class="toast" id="toast">
+    <div class="title" id="toastTitle">Connected</div>
+    <div class="muted" id="toastBody"></div>
+    <div class="row" style="margin-top:10px;">
+      <button class="btn gray" id="toastOk">OK</button>
+    </div>
+  </div>
+
+<script>
+const SUPABASE_URL = '__SUPABASE_URL__';
+const SUPABASE_ANON_KEY = '__SUPABASE_ANON_KEY__';
+
+let accessToken = localStorage.getItem('sb_access_token') || '';
+let userId = localStorage.getItem('sb_user_id') || '';
+let isAdmin = false;
+let lastApGrace = false;
+let toastRedirectUrl = '';
+
+function setBtnLoading(btn, loading, label) {
+  if (!btn) return;
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  if (label) btn.dataset.label = label;
+  if (loading) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> ' + btn.dataset.label;
+  } else {
+    btn.disabled = false;
+    btn.textContent = btn.dataset.label;
+  }
+}
+
+function wifiBarsSvg(rssi) {
+  let bars = 0;
+  if (typeof rssi !== 'number') bars = 0;
+  else if (rssi >= -55) bars = 4;
+  else if (rssi >= -65) bars = 3;
+  else if (rssi >= -75) bars = 2;
+  else if (rssi >= -85) bars = 1;
+  else bars = 0;
+
+  const cOn = '#22c55e';
+  const cOff = 'rgba(148,163,184,0.35)';
+  const b = [bars>=1, bars>=2, bars>=3, bars>=4];
+  return `\n  <svg width="22" height="18" viewBox="0 0 22 18" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">\n    <rect x="1" y="11" width="3" height="6" rx="1" fill="${b[0]?cOn:cOff}"/>\n    <rect x="6" y="8" width="3" height="9" rx="1" fill="${b[1]?cOn:cOff}"/>\n    <rect x="11" y="5" width="3" height="12" rx="1" fill="${b[2]?cOn:cOff}"/>\n    <rect x="16" y="2" width="3" height="15" rx="1" fill="${b[3]?cOn:cOff}"/>\n  </svg>`;
+}
+
+async function apiGet(path) {
+  const res = await fetch(path, { cache: 'no-store' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return await res.json();
+}
+
+async function apiText(path) {
+  const res = await fetch(path, { cache: 'no-store' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return await res.text();
+}
+
+function renderLog(preId, text) {
+  const pre = document.getElementById(preId);
+  const lines = String(text || '').split('\n');
+  let html = '';
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (!line) continue;
+    const lower = line.toLowerCase();
+    let cls = 'log-muted';
+    if (lower.includes('failed') || lower.includes('error') || lower.includes('not authorized') || lower.includes('disconnect')) cls = 'log-bad';
+    else if (lower.includes('warning') || lower.includes('no internet') || lower.includes('connecting')) cls = 'log-warn';
+    else if (lower.includes('connected') || lower.includes('saved') || lower.includes('updated') || lower.includes('time synchronized')) cls = 'log-ok';
+    if (line.match(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)) cls = 'log-time';
+    html += `<span class="logline ${cls}">${line.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}</span>`;
+  }
+  pre.innerHTML = html || '<span class="logline log-muted">(empty)</span>';
+}
+
+function showToast(title, body, redirectUrl) {
+  const t = document.getElementById('toast');
+  document.getElementById('toastTitle').textContent = title;
+  document.getElementById('toastBody').textContent = body;
+  toastRedirectUrl = redirectUrl || '';
+  t.style.display = 'block';
+  clearTimeout(window.__toastTimer);
+  window.__toastTimer = setTimeout(() => { t.style.display = 'none'; }, 12000);
+}
+
+async function refreshMonitor() {
+  try {
+    renderLog('monitor', await apiText('/monitor'));
+  } catch (e) {
+    renderLog('monitor', 'Fetch failed');
+  }
+}
+
+async function refreshEvents() {
+  try {
+    renderLog('events', await apiText('/events'));
+  } catch (e) {}
+}
+
+async function getStatus() {
+  try {
+    return await apiGet('/status');
+  } catch (e) {
+    return { connected:false, internet:false, ssid:'', rssi: null, ip:'', gw:'', apip:'', yellow:0, red:0, mp3vol:30, speaker:false };
+  }
+}
+
+function setSubtitle(s) {
+  document.getElementById('subtitle').textContent = s;
+}
+
+function show(el, on) {
+  if (on) el.classList.remove('hide');
+  else el.classList.add('hide');
+}
+
+async function supabaseLogin(email, password) {
+  const url = SUPABASE_URL + '/auth/v1/token?grant_type=password';
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': SUPABASE_ANON_KEY
+    },
+    body: JSON.stringify({ email, password })
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error_description || data.msg || 'login_failed');
+  accessToken = data.access_token;
+  userId = data.user && data.user.id ? data.user.id : '';
+  localStorage.setItem('sb_access_token', accessToken);
+  localStorage.setItem('sb_user_id', userId);
+  return { accessToken, userId };
+}
+
+async function supabaseLogout() {
+  accessToken = '';
+  userId = '';
+  isAdmin = false;
+  localStorage.removeItem('sb_access_token');
+  localStorage.removeItem('sb_user_id');
+}
+
+async function fetchRole() {
+  if (!accessToken || !userId) return '';
+  const url = SUPABASE_URL + '/rest/v1/profiles?select=role&id=eq.' + encodeURIComponent(userId) + '&limit=1';
+  const res = await fetch(url, {
+    headers: {
+      'apikey': SUPABASE_ANON_KEY,
+      'Authorization': 'Bearer ' + accessToken
+    }
+  });
+  const data = await res.json();
+  if (!res.ok) return '';
+  if (!Array.isArray(data) || data.length === 0) return '';
+  return data[0].role || '';
+}
+
+async function refreshUI() {
+  const st = await getStatus();
+
+  document.getElementById('topLogoutBtn').style.display = (accessToken && userId) ? '' : 'none';
+  document.getElementById('logoutBtn').style.display = (accessToken && userId) ? '' : 'none';
+
+  const netPill = document.getElementById('netPill');
+  const netDetails = document.getElementById('netDetails');
+  const controlsCard = document.getElementById('controlsCard');
+  const loginCard = document.getElementById('loginCard');
+
+  const netState = st.connected ? (st.internet ? 'Connected + Internet' : 'Connected (No Internet)') : 'Not connected';
+  const badge = st.connected ? (st.internet ? 'ok' : 'warn') : 'bad';
+  const ssid = st.ssid || '-';
+  const icon = wifiBarsSvg(typeof st.rssi === 'number' ? st.rssi : null);
+  netPill.innerHTML = icon + `<span>${ssid}</span> <span class="badge ${badge}">${netState}</span>`;
+  netDetails.textContent = `STA IP: ${st.ip || '-'} | GW: ${st.gw || '-'} | AP IP: ${st.apip || '-'}`;
+  setSubtitle(st.connected ? (st.internet ? 'Device online' : 'Device connected (no internet)') : 'Device offline');
+
+  document.getElementById('disconnectBtn').disabled = !st.connected;
+
+  const needWifiFix = (!st.connected) || (!st.internet);
+  show(document.getElementById('netList'), needWifiFix);
+  show(document.getElementById('netMsg'), needWifiFix);
+  document.getElementById('scanBtn').disabled = !needWifiFix;
+
+  const netMsg = document.getElementById('netMsg');
+  if (st.apGrace && st.ip) {
+    netMsg.textContent = `Connected to Wi-Fi. Setup AP will turn off soon. Connect your phone to the same Wi-Fi and open: http://${st.ip}/`;
+    if (!lastApGrace) {
+      showToast('Wi-Fi Connected', `Now join "${st.ssid || 'your Wi-Fi'}" and open: http://${st.ip}/`, `http://${st.ip}/`);
+    }
+  } else if (!needWifiFix && st.connected) {
+    netMsg.textContent = 'Connected to Wi-Fi: ' + ssid;
+  }
+  lastApGrace = !!st.apGrace;
+
+  if (!accessToken || !userId) {
+    isAdmin = false;
+    show(loginCard, true);
+    show(controlsCard, false);
+    if (!st.internet) {
+      document.getElementById('loginMsg').textContent = 'Login requires internet. Fix Wi-Fi first.';
+    }
+    return;
+  }
+
+  const role = await fetchRole();
+  isAdmin = (role === 'admin');
+  if (!isAdmin) {
+    show(loginCard, true);
+    show(controlsCard, false);
+    document.getElementById('loginMsg').textContent = 'Not authorized: role=' + (role || 'unknown');
+    return;
+  }
+
+  show(loginCard, false);
+  show(controlsCard, true);
+  document.getElementById('yellow').value = (typeof st.yellow === 'number') ? st.yellow : '';
+  document.getElementById('red').value = (typeof st.red === 'number') ? st.red : '';
+  document.getElementById('speakerPill').textContent = 'Speaker: ' + (st.speaker ? 'ON' : 'OFF');
+  if (typeof st.mp3vol === 'number') {
+    document.getElementById('vol').value = st.mp3vol;
+    document.getElementById('volVal').textContent = String(st.mp3vol);
+  }
+  await refreshMonitor();
+}
+
+async function scanAndRender() {
+  const list = document.getElementById('netList');
+  const msg = document.getElementById('netMsg');
+  list.innerHTML = '';
+  msg.textContent = '';
+  try {
+    const nets = await apiGet('/scan');
+    for (const n of nets) {
+      const el = document.createElement('div');
+      el.className = 'net';
+      const icon = wifiBarsSvg(n.rssi);
+      el.innerHTML = `<div>\n        <div style="font-weight:700;">${n.ssid}</div>\n        <div class="muted">${n.secure ? 'Secured' : 'Open'} | ${n.rssi} dBm</div>\n      </div>\n      <div class="right">${icon}</div>`;
+
+      el.addEventListener('click', async () => {
+        const pw = n.secure ? prompt('Password for ' + n.ssid + ':') : '';
+        if (n.secure && (!pw || pw.length < 1)) return;
+        msg.textContent = 'Saving Wi-Fi...';
+        const form = new URLSearchParams();
+        form.append('ssid', n.ssid);
+        form.append('password', pw || '');
+        await fetch('/save', { method:'POST', body: form });
+        msg.textContent = 'Saved. Connecting...';
+        showToast('Wi-Fi Saved', `If connection succeeds, join "${n.ssid}" then open the device via its router IP (it will show here).`, '');
+        setTimeout(refreshUI, 1200);
+      });
+
+      list.appendChild(el);
+    }
+    if (!nets || nets.length === 0) msg.textContent = 'No networks found.';
+  } catch (e) {
+    msg.textContent = 'Scan failed.';
+  }
+}
+
+document.getElementById('loginBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('loginBtn');
+  const msg = document.getElementById('loginMsg');
+  setBtnLoading(btn, true, 'Login');
+  msg.textContent = 'Logging in...';
+  try {
+    await supabaseLogin(document.getElementById('email').value.trim(), document.getElementById('password').value);
+    msg.textContent = 'Logged in.';
+    await refreshUI();
+  } catch (e) {
+    msg.textContent = String(e.message || e);
+  } finally {
+    setBtnLoading(btn, false, 'Login');
+  }
+  document.getElementById('logoutBtn').style.display = (accessToken && userId) ? '' : 'none';
+});
+
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  await supabaseLogout();
+  document.getElementById('loginMsg').textContent = 'Logged out.';
+  await refreshUI();
+  document.getElementById('logoutBtn').style.display = (accessToken && userId) ? '' : 'none';
+});
+
+document.getElementById('topLogoutBtn').addEventListener('click', async () => {
+  await supabaseLogout();
+  document.getElementById('loginMsg').textContent = 'Logged out.';
+  await refreshUI();
+});
+
+document.getElementById('scanBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('scanBtn');
+  setBtnLoading(btn, true, 'Scan Wi-Fi');
+  try { await scanAndRender(); } finally { setBtnLoading(btn, false, 'Scan Wi-Fi'); }
+});
+
+document.getElementById('disconnectBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('disconnectBtn');
+  setBtnLoading(btn, true, 'Disconnect');
+  try { await fetch('/disconnect'); } catch (e) {}
+  setTimeout(async () => { setBtnLoading(btn, false, 'Disconnect'); await refreshUI(); }, 900);
+});
+
+document.getElementById('saveThreshBtn').addEventListener('click', async () => {
+  const y = document.getElementById('yellow').value;
+  const r = document.getElementById('red').value;
+  const msg = document.getElementById('ctrlMsg');
+  const btn = document.getElementById('saveThreshBtn');
+  setBtnLoading(btn, true, 'Save Thresholds');
+  msg.textContent = 'Saving...';
+  try {
+    await fetch('/setThresholds?yellow=' + encodeURIComponent(y) + '&red=' + encodeURIComponent(r));
+    msg.textContent = 'Saved.';
+  } catch (e) {
+    msg.textContent = 'Save failed.';
+  }
+  setBtnLoading(btn, false, 'Save Thresholds');
+});
+
+document.getElementById('speakerBtn').addEventListener('click', async () => {
+  const msg = document.getElementById('ctrlMsg');
+  const btn = document.getElementById('speakerBtn');
+  setBtnLoading(btn, true, 'Toggle Speaker');
+  msg.textContent = 'Updating...';
+  try {
+    const st = await getStatus();
+    const next = st.speaker ? '0' : '1';
+    await fetch('/setSpeaker?enabled=' + next);
+    msg.textContent = 'Updated.';
+  } catch (e) {
+    msg.textContent = 'Failed.';
+  }
+  setBtnLoading(btn, false, 'Toggle Speaker');
+  setTimeout(refreshUI, 600);
+});
+
+async function mp3Action(btn, label, url, nowText) {
+  setBtnLoading(btn, true, label);
+  document.getElementById('mp3Now').textContent = nowText;
+  try {
+    await fetch(url);
+  } catch (e) {
+    document.getElementById('mp3Now').textContent = 'Failed';
+  }
+  setBtnLoading(btn, false, label);
+}
+
+let volTimer = 0;
+async function setVolumeDebounced(v) {
+  clearTimeout(volTimer);
+  volTimer = setTimeout(async () => {
+    try { await fetch('/setMp3Volume?vol=' + encodeURIComponent(v)); } catch (e) {}
+  }, 120);
+}
+
+document.getElementById('mp3Play01').addEventListener('click', async () => {
+  await mp3Action(document.getElementById('mp3Play01'), 'Play 01', '/playTest001', 'Playing 01...');
+});
+document.getElementById('mp3Play02').addEventListener('click', async () => {
+  await mp3Action(document.getElementById('mp3Play02'), 'Play 02', '/playTest002', 'Playing 02...');
+});
+document.getElementById('mp3Play03').addEventListener('click', async () => {
+  await mp3Action(document.getElementById('mp3Play03'), 'Play 03', '/playTest003', 'Playing 03...');
+});
+document.getElementById('mp3Stop').addEventListener('click', async () => {
+  await mp3Action(document.getElementById('mp3Stop'), 'Stop', '/stopMp3', 'Stopped');
+});
+
+document.getElementById('vol').addEventListener('input', async (e) => {
+  const v = parseInt(e.target.value || '0', 10);
+  document.getElementById('volVal').textContent = String(v);
+  await setVolumeDebounced(v);
+});
+
+document.getElementById('toastOk').addEventListener('click', () => {
+  document.getElementById('toast').style.display = 'none';
+  if (toastRedirectUrl) {
+    window.location.href = toastRedirectUrl;
+  } else {
+    window.location.reload();
+  }
+});
+
+async function boot() {
+  await refreshUI();
+  await refreshEvents();
+  setInterval(refreshEvents, 800);
+  setInterval(async () => { await refreshUI(); }, 2500);
+  setInterval(async () => { if (isAdmin) await refreshMonitor(); }, 800);
+}
+boot();
+</script>
+</body>
+</html>)HTMLPAGE";
