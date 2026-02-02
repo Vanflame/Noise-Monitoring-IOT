@@ -1074,7 +1074,8 @@ void updateStatusLed(unsigned long now) {
   const bool micError = (micZeroStartMs != 0) && (now - micZeroStartMs >= 3000);
   const bool sdError = !sdAvailable;
   const bool supaError = (lastSupabaseFailMs != 0) && (now - lastSupabaseFailMs <= 60000);
-  const bool anyError = sdError || supaError || micError;
+  const bool mp3Error = !mp3Available;
+  const bool anyError = sdError || supaError || micError || mp3Error;
 
   const bool isBooting = !setupComplete;
   const bool apEnabled = (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA);
@@ -1966,7 +1967,7 @@ void loop() {
       }
 
       WiFi.mode(WIFI_AP_STA);
-      WiFi.softAP("ESP32_NOISE_Setup", "12345678");
+      WiFi.softAP("ESP32_NOISE_Setup1", "12345678");
       logNetworkInfo("WiFi connect failed");
     }
   }
