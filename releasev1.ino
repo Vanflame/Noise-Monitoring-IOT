@@ -169,6 +169,8 @@ int mp3Volume = 30;
 
 bool mp3Available = false;
 unsigned long lastMp3RxMs = 0;
+unsigned long lastMp3OkMs = 0;
+uint8_t mp3ConsecutiveFailCount = 0;
 bool mp3TfOnline = false;
 unsigned long lastMp3ProbeMs = 0;
 
@@ -1297,10 +1299,20 @@ static bool mp3Query1(uint8_t cmd, uint8_t &valOut) {
 static void probeMp3() {
   uint8_t online = 0;
   bool ok = mp3Query1(0x18, online);
-  mp3Available = ok;
+  const unsigned long now = millis();
   if (ok) {
+    mp3ConsecutiveFailCount = 0;
+    mp3Available = true;
+    lastMp3OkMs = now;
     mp3TfOnline = (online == 2);
-  } else {
+    return;
+  }
+
+  // Don't immediately mark missing on a single failed probe; require sustained failures.
+  if (mp3ConsecutiveFailCount < 255) mp3ConsecutiveFailCount++;
+  const bool graceExpired = (lastMp3OkMs != 0) && (now - lastMp3OkMs >= 12000);
+  if (graceExpired && mp3ConsecutiveFailCount >= 2) {
+    mp3Available = false;
     mp3TfOnline = false;
   }
 }
@@ -1898,6 +1910,8 @@ void loop() {
     (void)mp3.read();
     lastMp3RxMs = now;
     mp3Available = true;
+    lastMp3OkMs = now;
+    mp3ConsecutiveFailCount = 0;
   }
 
   if (now - lastMp3ProbeMs >= 5000) {
