@@ -69,8 +69,14 @@ String networkPassword = "";
 bool wifiConnecting = false;
 bool wifiConnected = false;
 unsigned long wifiStartTime = 0;
-const unsigned long WIFI_TIMEOUT = 15000;
+const unsigned long WIFI_TIMEOUT = 30000;
+unsigned long lastWifiRetryMs = 0;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 20000;
 String wifiStatusMessage = "Not connected";
+
+String lastScanJson = "[]";
+bool wifiScanRunning = false;
+unsigned long wifiScanStartMs = 0;
 
 Preferences preferences;
 WebServer server(80);
@@ -145,6 +151,11 @@ unsigned long lastDbRecordMs = 0;
 unsigned long lastDbBulkUploadMs = 0;
 
 int mp3Volume = 30;
+
+bool mp3Available = false;
+unsigned long lastMp3RxMs = 0;
+bool mp3TfOnline = false;
+unsigned long lastMp3ProbeMs = 0;
 
 const int EVENT_LOG_MAX = 40;
 String eventLog[EVENT_LOG_MAX];
@@ -688,9 +699,30 @@ void queueRedWarningEvent(const String &warningLevel, int durationSeconds, int d
 }
 
 void handleScanNetworks() {
-  int n = WiFi.scanNetworks(false, true);
+  int n = WiFi.scanComplete();
+  if (n == -1) {
+    if (wifiScanRunning && (millis() - wifiScanStartMs > 20000)) {
+      WiFi.scanDelete();
+      wifiScanRunning = false;
+      lastScanJson = "[]";
+    }
+    server.send(200, "application/json", lastScanJson);
+    return;
+  }
+  if (n == -2) {
+    WiFi.scanDelete();
+    wifiScanRunning = false;
+    lastScanJson = "[]";
+  }
+
   if (n < 0) {
-    server.send(500, "application/json", "[]");
+    if (!wifiScanRunning) {
+      WiFi.scanDelete();
+      WiFi.scanNetworks(true, true);
+      wifiScanRunning = true;
+      wifiScanStartMs = millis();
+    }
+    server.send(200, "application/json", lastScanJson);
     return;
   }
 
@@ -727,7 +759,9 @@ void handleScanNetworks() {
   out += "]";
 
   WiFi.scanDelete();
-  server.send(200, "application/json", out);
+  wifiScanRunning = false;
+  lastScanJson = out;
+  server.send(200, "application/json", lastScanJson);
 }
 
 void trySyncPendingEvents() {
@@ -1160,10 +1194,108 @@ void stopMP3() {
   mp3.write(pauseCmd, sizeof(pauseCmd));
 }
 
+static inline void mp3WriteCmd(uint8_t cmd, const uint8_t *data, size_t dataLen) {
+  uint8_t len = (uint8_t)(2 + dataLen);
+  mp3.write((uint8_t)0x7E);
+  mp3.write(len);
+  mp3.write(cmd);
+  for (size_t i = 0; i < dataLen; i++) mp3.write(data[i]);
+  mp3.write((uint8_t)0xEF);
+}
+
+static bool mp3ReadFrame(uint8_t &cmdOut, uint8_t *dataOut, size_t dataOutCap, size_t &dataLenOut, unsigned long timeoutMs) {
+  unsigned long start = millis();
+  bool started = false;
+  uint8_t len = 0;
+  uint8_t payload[16];
+  size_t payloadLen = 0;
+
+  while (millis() - start < timeoutMs) {
+    while (mp3.available()) {
+      uint8_t b = (uint8_t)mp3.read();
+      lastMp3RxMs = millis();
+
+      if (!started) {
+        if (b == 0x7E) {
+          started = true;
+          payloadLen = 0;
+          len = 0;
+        }
+        continue;
+      }
+
+      if (len == 0) {
+        len = b;
+        if (len < 2) {
+          started = false;
+          len = 0;
+        }
+        continue;
+      }
+
+      size_t needPayload = (size_t)(len - 1);
+      if (payloadLen < needPayload) {
+        if (payloadLen < sizeof(payload)) payload[payloadLen] = b;
+        payloadLen++;
+        continue;
+      }
+
+      if (b != 0xEF) {
+        started = false;
+        len = 0;
+        payloadLen = 0;
+        continue;
+      }
+
+      if (payloadLen < 1) {
+        started = false;
+        len = 0;
+        payloadLen = 0;
+        continue;
+      }
+
+      cmdOut = payload[0];
+      size_t dlen = (payloadLen >= 1) ? (payloadLen - 1) : 0;
+      dataLenOut = (dlen > dataOutCap) ? dataOutCap : dlen;
+      for (size_t i = 0; i < dataLenOut; i++) dataOut[i] = payload[i + 1];
+      return true;
+    }
+    delay(2);
+  }
+  return false;
+}
+
+static bool mp3Query1(uint8_t cmd, uint8_t &valOut) {
+  while (mp3.available()) mp3.read();
+  mp3WriteCmd(cmd, nullptr, 0);
+  uint8_t rcmd = 0;
+  uint8_t data[4];
+  size_t dlen = 0;
+  if (!mp3ReadFrame(rcmd, data, sizeof(data), dlen, 180)) return false;
+  if (rcmd != cmd) return false;
+  if (dlen < 1) return false;
+  valOut = data[0];
+  return true;
+}
+
+static void probeMp3() {
+  uint8_t online = 0;
+  bool ok = mp3Query1(0x18, online);
+  mp3Available = ok;
+  if (ok) {
+    mp3TfOnline = (online == 2);
+  } else {
+    mp3TfOnline = false;
+  }
+}
+
 void handleRoot() {
   String html = FPSTR(INDEX_HTML);
   html.replace("__SUPABASE_URL__", String(SUPABASE_URL));
   html.replace("__SUPABASE_ANON_KEY__", String(SUPABASE_API_KEY));
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
   server.send(200, "text/html", html);
 }
 
@@ -1209,7 +1341,9 @@ void handleStatus() {
   out += "\"db_hb\":" + String(dbHeartbeatMs) + ",";
   out += "\"db_up\":" + String(dbBulkUploadIntervalMs) + ",";
   out += "\"mp3vol\":" + String(mp3Volume) + ",";
-  out += "\"speaker\":" + String(speakerEnabled ? "true" : "false");
+  out += "\"speaker\":" + String(speakerEnabled ? "true" : "false") + ",";
+  out += "\"mp3err\":" + String((!mp3Available) ? "true" : "false") + ",";
+  out += "\"mp3tferr\":" + String((mp3Available && !mp3TfOnline) ? "true" : "false");
   out += "}";
   server.send(200, "application/json", out);
 }
@@ -1421,6 +1555,13 @@ void handleSetSpeaker() {
 }
 
 void handleDisconnect() {
+  preferences.begin("wifi", false);
+  preferences.remove("ssid");
+  preferences.remove("password");
+  preferences.end();
+  networkSSID = "";
+  networkPassword = "";
+
   WiFi.disconnect(false, true);
   delay(100);
   WiFi.mode(WIFI_AP_STA);
@@ -1492,6 +1633,7 @@ void handleNetworkConnection() {
 
     WiFi.disconnect(true);
     delay(500);
+    Serial.println(String("WiFi begin (manual save) SSID=") + networkSSID);
     WiFi.begin(networkSSID.c_str(), networkPassword.c_str());
 
     wifiConnecting = true;
@@ -1516,6 +1658,8 @@ void connectToWiFi() {
   }
 
   if (networkSSID.length() > 0) {
+    lastWifiRetryMs = millis();
+    Serial.println(String("WiFi begin (boot) SSID=") + networkSSID);
     WiFi.begin(networkSSID.c_str(), networkPassword.c_str());
     wifiConnecting = true;
     wifiConnected = false;
@@ -1651,8 +1795,11 @@ void setup() {
   loadDeviceSettings();
 
   initLedPwm();
-
+  
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
   WiFi.softAP("ESP32_NOISE_Setup", "12345678");
   logNetworkInfo("Boot");
   connectToWiFi();
@@ -1690,6 +1837,11 @@ void setup() {
   delayWithStatus(8000);                              // MP3 boot time
   mp3.begin(9600, SERIAL_8N1, 16, 17);      // RX, TX
 
+  probeMp3();
+  if (mp3Available) {
+    setMP3Volume((uint8_t)constrain(mp3Volume, 0, 30));
+  }
+
   // ===== I2S SETUP =====
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -1720,6 +1872,17 @@ void setup() {
 // ================= LOOP =================
 void loop() {
   unsigned long now = millis();
+
+  while (mp3.available()) {
+    (void)mp3.read();
+    lastMp3RxMs = now;
+    mp3Available = true;
+  }
+
+  if (now - lastMp3ProbeMs >= 5000) {
+    lastMp3ProbeMs = now;
+    probeMp3();
+  }
 
   server.handleClient();
 
@@ -1771,10 +1934,28 @@ void loop() {
       wifiStatusMessage = "Connection Failed";
       appendEventLog(getTimeString() + " | WiFi connection failed");
 
+      Serial.print("WiFi connect timeout. status=");
+      Serial.print(WiFi.status());
+      Serial.print(" reason=");
+      Serial.println(WiFi.disconnectReasonName());
+
       WiFi.mode(WIFI_AP_STA);
       WiFi.softAP("ESP32_NOISE_Setup", "12345678");
       logNetworkInfo("WiFi connect failed");
     }
+  }
+
+  if (!wifiConnected && !wifiConnecting && (networkSSID.length() > 0) && (now - lastWifiRetryMs >= WIFI_RETRY_INTERVAL_MS)) {
+    lastWifiRetryMs = now;
+    WiFi.disconnect(true);
+    delay(200);
+    Serial.println(String("WiFi begin (retry) SSID=") + networkSSID);
+    WiFi.begin(networkSSID.c_str(), networkPassword.c_str());
+    wifiConnecting = true;
+    wifiStartTime = millis();
+    wifiStatusMessage = "Reconnecting...";
+    appendEventLog(getTimeString() + " | WiFi reconnect attempt");
+    logNetworkInfo("WiFi reconnect attempt");
   }
 
   if (now - lastSupabaseSyncTime >= SUPABASE_SYNC_INTERVAL_MS) {

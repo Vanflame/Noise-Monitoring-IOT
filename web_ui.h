@@ -112,6 +112,26 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
       </div>
       <div class="list" id="netList" style="margin-top:10px;"></div>
       <div class="muted" id="netMsg" style="margin-top:8px;"></div>
+
+      <div class="player hide" id="manualWifi" style="margin-top:10px;">
+        <div class="meta">
+          <div style="font-weight:700;">Manual Wi-Fi</div>
+          <div class="muted">If scan finds no networks, enter SSID and password here.</div>
+        </div>
+        <div style="flex: 1 1 260px; width:100%;">
+          <label>SSID</label>
+          <input id="manualSsid" type="text" placeholder="Your Wi-Fi name" />
+          <div style="height:8px"></div>
+          <label>Password</label>
+          <input id="manualPw" type="password" placeholder="Wi-Fi password" />
+          <div style="height:10px"></div>
+          <div class="row row-actions">
+            <button class="btn" id="manualSaveBtn">Save Wi-Fi</button>
+            <button class="btn gray" id="manualHideBtn">Hide</button>
+          </div>
+          <div class="muted" id="manualMsg" style="margin-top:8px;"></div>
+        </div>
+      </div>
     </div>
 
     <div class="card hide" id="controlsCard">
@@ -134,6 +154,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
           <button class="btn gray" id="speakerBtn">Toggle Speaker</button>
         </div>
         <div class="pill" id="speakerPill">Speaker: ...</div>
+        <div class="muted" id="speakerDisableReason" style="display:none;"></div>
 
         <div>
           <label>MP3 Player</label>
@@ -162,8 +183,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
               <div style="font-weight:700;">Noise LEDs</div>
               <div class="muted">Adjust brightness for Green/Yellow/Red indicators</div>
             </div>
-            <div class="range" style="flex: 1 1 220px;">
-              <div class="pill">Enabled</div>
+            <div class="row" style="gap:12px;">
+              <div class="pill">Noise LEDs</div>
               <label class="switch">
                 <input id="nleden" type="checkbox" />
                 <span class="slider"></span>
@@ -244,13 +265,14 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
               <div style="font-weight:700;">Monitoring</div>
               <div class="muted">Disable MIC processing or Serial printing</div>
             </div>
-            <div class="range" style="flex: 1 1 220px;">
-              <div class="pill">MIC</div>
+            <div class="row" style="gap:12px; justify-content:flex-start;">
+              <div class="pill">Microphone</div>
               <label class="switch">
                 <input id="micen" type="checkbox" />
                 <span class="slider"></span>
               </label>
             </div>
+            <div class="muted" id="micDisableReason" style="display:none;"></div>
             <div class="range" style="flex: 1 1 220px;">
               <div class="pill">Serial Log</div>
               <label class="switch">
@@ -287,6 +309,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
             <div class="range" style="flex: 1 1 220px;">
               <button class="btn gray" id="dbSave">Save</button>
             </div>
+            <div class="muted" id="dbDisableReason" style="display:none;"></div>
           </div>
         </div>
 
@@ -321,6 +344,12 @@ let userId = localStorage.getItem('sb_user_id') || '';
 let isAdmin = false;
 let lastApGrace = false;
 let toastRedirectUrl = '';
+
+let scanRequested = false;
+let manualWifiDismissed = false;
+
+let lastConnected = false;
+let lastConnectedIp = '';
 
 function setBtnLoading(btn, loading, label) {
   if (!btn) return;
@@ -544,6 +573,21 @@ async function refreshUI() {
   show(document.getElementById('netMsg'), needWifiFix);
   document.getElementById('scanBtn').disabled = !needWifiFix;
 
+  const manualWifi = document.getElementById('manualWifi');
+  if (st.connected) {
+    scanRequested = false;
+    manualWifiDismissed = false;
+    if (manualWifi) {
+      manualWifi.classList.add('hide');
+      manualWifi.style.display = 'none';
+    }
+  } else if (manualWifiDismissed) {
+    if (manualWifi) {
+      manualWifi.classList.add('hide');
+      manualWifi.style.display = 'none';
+    }
+  }
+
   const netMsg = document.getElementById('netMsg');
   if (st.apGrace && st.ip) {
     netMsg.textContent = `Connected to Wi-Fi. Setup AP will turn off soon. Connect your phone to the same Wi-Fi and open: http://${st.ip}/`;
@@ -554,6 +598,14 @@ async function refreshUI() {
     netMsg.textContent = 'Connected to Wi-Fi: ' + ssid;
   }
   lastApGrace = !!st.apGrace;
+
+  if (st.connected && st.ip) {
+    if (!lastConnected || (lastConnectedIp !== st.ip)) {
+      showToast('Wi-Fi Connected', `Open the device at: http://${st.ip}/`, `http://${st.ip}/`);
+    }
+  }
+  lastConnected = !!st.connected;
+  lastConnectedIp = st.ip || '';
 
   if (!accessToken || !userId) {
     isAdmin = false;
@@ -584,6 +636,7 @@ async function refreshUI() {
   if (st.sderr) errs.push('SD card not detected');
   if (st.micerr) errs.push('MIC not detected / stuck at 0');
   if (st.supaerr) errs.push('Supabase error (recent post/upload failed)');
+  if (st.mp3err) errs.push('MP3 player not detected');
   if (errBanner && errBannerTitle && errBannerBody) {
     errBanner.classList.remove('bad');
     errBanner.classList.remove('warn');
@@ -603,7 +656,18 @@ async function refreshUI() {
   safeSetValue('red', (typeof st.red === 'number') ? st.red : '');
   document.getElementById('speakerPill').textContent = 'Speaker: ' + (st.speaker ? 'ON' : 'OFF');
 
-  const playDisabled = !st.speaker;
+  const speakerBtn = document.getElementById('speakerBtn');
+  const speakerReason = document.getElementById('speakerDisableReason');
+  if (speakerBtn) {
+    const disabled = !!st.mp3err;
+    speakerBtn.disabled = disabled;
+    if (speakerReason) {
+      speakerReason.textContent = disabled ? 'MP3 player not detected' : '';
+      speakerReason.style.display = disabled ? 'block' : 'none';
+    }
+  }
+
+  const playDisabled = (!st.speaker) || (!!st.mp3err);
   document.getElementById('mp3Play01').disabled = playDisabled;
   document.getElementById('mp3Play02').disabled = playDisabled;
   document.getElementById('mp3Play03').disabled = playDisabled;
@@ -635,7 +699,14 @@ async function refreshUI() {
   }
 
   if (typeof st.micen === 'boolean') {
-    document.getElementById('micen').checked = st.micen;
+    const micCb = document.getElementById('micen');
+    micCb.checked = st.micen;
+    micCb.disabled = !!st.micerr;
+    const micReason = document.getElementById('micDisableReason');
+    if (micReason) {
+      micReason.textContent = st.micerr ? 'MIC not detected' : '';
+      micReason.style.display = st.micerr ? 'block' : 'none';
+    }
   }
   if (typeof st.serlog === 'boolean') {
     document.getElementById('serlog').checked = st.serlog;
@@ -645,6 +716,23 @@ async function refreshUI() {
   if (typeof st.db_thr10 === 'number') safeSetValue('db_thr', String((st.db_thr10 / 10.0).toFixed(1)));
   if (typeof st.db_hb === 'number') safeSetValue('db_hb', String(Math.round(st.db_hb / 1000)));
   if (typeof st.db_up === 'number') safeSetValue('db_up', String(Math.round(st.db_up / 60000)));
+
+  const sdOff = !!st.sderr;
+  const dbSampEl = document.getElementById('db_samp');
+  const dbThrEl = document.getElementById('db_thr');
+  const dbHbEl = document.getElementById('db_hb');
+  const dbUpEl = document.getElementById('db_up');
+  const dbSaveEl = document.getElementById('dbSave');
+  if (dbSampEl) dbSampEl.disabled = sdOff;
+  if (dbThrEl) dbThrEl.disabled = sdOff;
+  if (dbHbEl) dbHbEl.disabled = sdOff;
+  if (dbUpEl) dbUpEl.disabled = sdOff;
+  if (dbSaveEl) dbSaveEl.disabled = sdOff;
+  const dbReason = document.getElementById('dbDisableReason');
+  if (dbReason) {
+    dbReason.textContent = sdOff ? 'SD card not detected' : '';
+    dbReason.style.display = sdOff ? 'block' : 'none';
+  }
 
   function intToHex(v) {
     let s = (v >>> 0).toString(16);
@@ -674,10 +762,18 @@ async function refreshUI() {
 async function scanAndRender() {
   const list = document.getElementById('netList');
   const msg = document.getElementById('netMsg');
+  const manual = document.getElementById('manualWifi');
   list.innerHTML = '';
   msg.textContent = '';
   try {
-    const nets = await apiGet('/scan');
+    let nets = await apiGet('/scan');
+    let tries = 0;
+    while ((!nets || nets.length === 0) && tries < 10) {
+      msg.textContent = 'Scanning...';
+      await new Promise(r => setTimeout(r, 700));
+      nets = await apiGet('/scan');
+      tries++;
+    }
     for (const n of nets) {
       const el = document.createElement('div');
       el.className = 'net';
@@ -699,10 +795,50 @@ async function scanAndRender() {
 
       list.appendChild(el);
     }
-    if (!nets || nets.length === 0) msg.textContent = 'No networks found.';
+    if (!nets || nets.length === 0) {
+      msg.textContent = 'No networks found.';
+      if (manual && scanRequested && !manualWifiDismissed) {
+        manual.classList.remove('hide');
+        manual.style.display = 'flex';
+      }
+    } else {
+      if (manual) {
+        manual.classList.add('hide');
+        manual.style.display = 'none';
+      }
+    }
   } catch (e) {
     msg.textContent = 'Scan failed.';
+    if (manual && scanRequested && !manualWifiDismissed) {
+      manual.classList.remove('hide');
+      manual.style.display = 'flex';
+    }
   }
+}
+
+async function manualSaveWifi() {
+  const ssid = (document.getElementById('manualSsid').value || '').trim();
+  const pw = (document.getElementById('manualPw').value || '');
+  const msg = document.getElementById('manualMsg');
+  const btn = document.getElementById('manualSaveBtn');
+  if (!ssid) {
+    msg.textContent = 'SSID is required.';
+    return;
+  }
+  setBtnLoading(btn, true, 'Save Wi-Fi');
+  msg.textContent = 'Saving Wi-Fi...';
+  try {
+    const form = new URLSearchParams();
+    form.append('ssid', ssid);
+    form.append('password', pw || '');
+    await fetch('/save', { method:'POST', body: form });
+    msg.textContent = 'Saved. Connecting...';
+    showToast('Wi-Fi Saved', 'Trying to connect. If it succeeds, join the same Wi-Fi and open the device via its router IP (it will show above).', '');
+    setTimeout(refreshUI, 1200);
+  } catch (e) {
+    msg.textContent = 'Save failed.';
+  }
+  setBtnLoading(btn, false, 'Save Wi-Fi');
 }
 
 document.getElementById('loginBtn').addEventListener('click', async () => {
@@ -738,7 +874,23 @@ document.getElementById('topLogoutBtn').addEventListener('click', async () => {
 document.getElementById('scanBtn').addEventListener('click', async () => {
   const btn = document.getElementById('scanBtn');
   setBtnLoading(btn, true, 'Scan Wi-Fi');
+  scanRequested = true;
+  manualWifiDismissed = false;
   try { await scanAndRender(); } finally { setBtnLoading(btn, false, 'Scan Wi-Fi'); }
+});
+
+document.getElementById('manualSaveBtn').addEventListener('click', async () => {
+  await manualSaveWifi();
+});
+
+document.getElementById('manualHideBtn').addEventListener('click', async (e) => {
+  if (e && e.preventDefault) e.preventDefault();
+  const manual = document.getElementById('manualWifi');
+  manualWifiDismissed = true;
+  if (manual) {
+    manual.classList.add('hide');
+    manual.style.display = 'none';
+  }
 });
 
 document.getElementById('disconnectBtn').addEventListener('click', async () => {
@@ -940,13 +1092,21 @@ hookStatusRgbNumbers('sr_off', 'off');
 document.getElementById('toastOk').addEventListener('click', () => {
   document.getElementById('toast').style.display = 'none';
   if (toastRedirectUrl) {
-    window.location.href = toastRedirectUrl;
+    window.location.assign(toastRedirectUrl);
   } else {
     window.location.reload();
   }
 });
 
 async function boot() {
+  const manualWifi = document.getElementById('manualWifi');
+  scanRequested = false;
+  manualWifiDismissed = false;
+  if (manualWifi) {
+    manualWifi.classList.add('hide');
+    manualWifi.style.display = 'none';
+  }
+
   // Track fields user edits so refreshUI won't overwrite them mid-typing
   watchEdit('yellow');
   watchEdit('red');
