@@ -10,6 +10,7 @@
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <esp_wifi_types.h>
 #include "web_ui.h"
 
 // ================= LED PWM =================
@@ -60,8 +61,8 @@ static inline void ledcWriteCompat(uint8_t channel, uint32_t duty) {
 }
 
 // ================= WIFI & TIME =================
-const char* defaultSsid = "HUAWEI-2.4G-Y66f";
-const char* defaultPassword = "AuKN4N4w";
+// const char* defaultSsid = "HUAWEI-2.4G-Y66f";
+// const char* defaultPassword = "AuKN4N4w";
 
 String networkSSID = "";
 String networkPassword = "";
@@ -73,6 +74,9 @@ const unsigned long WIFI_TIMEOUT = 30000;
 unsigned long lastWifiRetryMs = 0;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 20000;
 String wifiStatusMessage = "Not connected";
+
+uint8_t lastStaDisconnectReason = 0;
+bool lastStaDisconnectReasonValid = false;
 
 String lastScanJson = "[]";
 bool wifiScanRunning = false;
@@ -102,6 +106,8 @@ void loadDeviceSettings();
 void saveDeviceSettings();
 void logNetworkInfo(const String &tag);
 
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
+
 void initLedPwm();
 void setNoiseLedPwm(LedState s);
 void updateStatusLed(unsigned long now);
@@ -111,6 +117,15 @@ void presetToRgb(int preset, int intensity, int &r, int &g, int &b);
 void markSupabaseFail();
 void markSupabaseOk();
 void updateSdAvailability(unsigned long now);
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    lastStaDisconnectReason = info.wifi_sta_disconnected.reason;
+    lastStaDisconnectReasonValid = true;
+  } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+    lastStaDisconnectReasonValid = false;
+  }
+}
 
 void handleSetDbLogConfig();
 bool appendDbSeriesRecord(uint64_t tsMs, int db10);
@@ -1653,8 +1668,12 @@ void connectToWiFi() {
   preferences.end();
 
   if (networkSSID.length() == 0) {
-    networkSSID = defaultSsid;
-    networkPassword = defaultPassword;
+    wifiConnecting = false;
+    wifiConnected = false;
+    wifiStatusMessage = "Not configured";
+    appendEventLog(getTimeString() + " | WiFi not configured");
+    logNetworkInfo("WiFi not configured");
+    return;
   }
 
   if (networkSSID.length() > 0) {
@@ -1797,6 +1816,7 @@ void setup() {
   initLedPwm();
   
   WiFi.mode(WIFI_AP_STA);
+  WiFi.onEvent(onWiFiEvent);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
@@ -1937,7 +1957,13 @@ void loop() {
       Serial.print("WiFi connect timeout. status=");
       Serial.print(WiFi.status());
       Serial.print(" reason=");
-      Serial.println(WiFi.disconnectReasonName());
+      if (lastStaDisconnectReasonValid) {
+        Serial.print((int)lastStaDisconnectReason);
+        Serial.print(" ");
+        Serial.println(WiFi.disconnectReasonName((wifi_err_reason_t)lastStaDisconnectReason));
+      } else {
+        Serial.println("unknown");
+      }
 
       WiFi.mode(WIFI_AP_STA);
       WiFi.softAP("ESP32_NOISE_Setup", "12345678");

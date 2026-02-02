@@ -20,6 +20,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
     .row-actions .btn { flex: 1 1 140px; }
     .muted { color: var(--muted); font-size: 12px; }
     .pill { display:inline-flex; gap:8px; align-items:center; padding: 6px 10px; border-radius: 999px; background: rgba(148,163,184,0.12); border: 1px solid rgba(148,163,184,0.18); font-size: 12px; }
+    .warn-pill { display:inline-flex; align-items:center; padding: 6px 10px; border-radius: 999px; background: rgba(220,38,38,0.22); border: 1px solid rgba(220,38,38,0.45); color: #fecaca; font-size: 12px; width: fit-content; }
     .btn { background: var(--accent); color: white; border: none; padding: 10px 12px; border-radius: 10px; cursor: pointer; font-size: 14px; }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .btn.gray { background: rgba(148,163,184,0.22); }
@@ -154,7 +155,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
           <button class="btn gray" id="speakerBtn">Toggle Speaker</button>
         </div>
         <div class="pill" id="speakerPill">Speaker: ...</div>
-        <div class="muted" id="speakerDisableReason" style="display:none;"></div>
+        <div class="warn-pill" id="speakerDisableReason" style="display:none;"></div>
 
         <div>
           <label>MP3 Player</label>
@@ -272,7 +273,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
                 <span class="slider"></span>
               </label>
             </div>
-            <div class="muted" id="micDisableReason" style="display:none;"></div>
+            <div class="warn-pill" id="micDisableReason" style="display:none;"></div>
             <div class="range" style="flex: 1 1 220px;">
               <div class="pill">Serial Log</div>
               <label class="switch">
@@ -309,7 +310,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
             <div class="range" style="flex: 1 1 220px;">
               <button class="btn gray" id="dbSave">Save</button>
             </div>
-            <div class="muted" id="dbDisableReason" style="display:none;"></div>
+            <div class="warn-pill" id="dbDisableReason" style="display:none;"></div>
           </div>
         </div>
 
@@ -662,8 +663,8 @@ async function refreshUI() {
     const disabled = !!st.mp3err;
     speakerBtn.disabled = disabled;
     if (speakerReason) {
-      speakerReason.textContent = disabled ? 'MP3 player not detected' : '';
-      speakerReason.style.display = disabled ? 'block' : 'none';
+      speakerReason.textContent = st.mp3err ? 'MP3 player not detected' : '';
+      speakerReason.style.display = st.mp3err ? 'inline-flex' : 'none';
     }
   }
 
@@ -705,7 +706,7 @@ async function refreshUI() {
     const micReason = document.getElementById('micDisableReason');
     if (micReason) {
       micReason.textContent = st.micerr ? 'MIC not detected' : '';
-      micReason.style.display = st.micerr ? 'block' : 'none';
+      micReason.style.display = st.micerr ? 'inline-flex' : 'none';
     }
   }
   if (typeof st.serlog === 'boolean') {
@@ -731,7 +732,7 @@ async function refreshUI() {
   const dbReason = document.getElementById('dbDisableReason');
   if (dbReason) {
     dbReason.textContent = sdOff ? 'SD card not detected' : '';
-    dbReason.style.display = sdOff ? 'block' : 'none';
+    dbReason.style.display = sdOff ? 'inline-flex' : 'none';
   }
 
   function intToHex(v) {
