@@ -905,6 +905,37 @@ int trySyncPendingEvents() {
 
   startMs = millis();
 
+  // Batch non-audio events into one POST to reduce overhead.
+  const int batchMax = 10;
+  String batchJson;
+  batchJson.reserve(1024);
+  bool batchHasAny = false;
+  int batchCount = 0;
+  String batchLines[batchMax];
+  int batchLineCount = 0;
+
+  auto flushBatch = [&]() {
+    if (!batchHasAny || batchCount <= 0) return;
+    String url = String(SUPABASE_URL) + "/rest/v1/noise_events?on_conflict=id";
+    String body = "[" + batchJson + "]";
+    int postCode = 0;
+    String resp;
+    bool ok = supabasePostJson(url, body, postCode, resp);
+    if (!ok) {
+      logSupabaseStatus(getTimeString() + " | Supabase bulk insert FAIL | HTTP " + String(postCode) + " | " + truncateForLog(resp, 180));
+      for (int i = 0; i < batchLineCount; i++) out.println(batchLines[i]);
+      markSupabaseFail();
+    } else {
+      markSupabaseOk();
+      okCount += batchCount;
+      logSupabaseStatus(getTimeString() + " | Supabase bulk insert OK | count=" + String(batchCount) + " | HTTP " + String(postCode));
+    }
+    batchJson = "";
+    batchHasAny = false;
+    batchCount = 0;
+    batchLineCount = 0;
+  };
+
   while (in.available()) {
     server.handleClient();
     yield();
@@ -2514,7 +2545,7 @@ void handleRedWarnings(int value, unsigned long now) {
     int majorCfgSec = (int)(majorWarningTimeMs / 1000UL);
     if (d >= firstWarningTimeMs && !firstLogged) {
       uint64_t tsMs = getEpochMs();
-      logEvent(String("FIRST WARNING (RED ") + String(firstCfgSec) + "s)");
+      logEvent((String("FIRST WARNING (RED ") + String(firstCfgSec) + "s)").c_str());
       flickerActiveLed();
       playMP3(0x01);     // 001.mp3
       queueRedWarningEvent("FIRST", tsMs, currentViolationGroupId, firstCfgSec, value, false, "");
@@ -2522,7 +2553,7 @@ void handleRedWarnings(int value, unsigned long now) {
     }
     if (d >= secondWarningTimeMs && !secondLogged) {
       uint64_t tsMs = getEpochMs();
-      logEvent(String("SECOND WARNING (RED ") + String(secondCfgSec) + "s)");
+      logEvent((String("SECOND WARNING (RED ") + String(secondCfgSec) + "s)").c_str());
       flickerActiveLed();
       playMP3(0x02);     // 002.mp3
       queueRedWarningEvent("SECOND", tsMs, currentViolationGroupId, secondCfgSec, value, false, "");
@@ -2530,7 +2561,7 @@ void handleRedWarnings(int value, unsigned long now) {
     }
     if (d >= majorWarningTimeMs && !majorLogged) {
       uint64_t tsMs = getEpochMs();
-      logEvent(String("MAJOR WARNING (RED ") + String(majorCfgSec) + "s)");
+      logEvent((String("MAJOR WARNING (RED ") + String(majorCfgSec) + "s)").c_str());
       flickerActiveLed();
       recordINMP441Wav5s();
       playMP3(0x03);     // 003.mp3
