@@ -132,6 +132,10 @@ bool appendDbSeriesRecord(uint64_t tsMs, int db10);
 bool tryBulkUploadDbSeries(unsigned long now);
 uint64_t getEpochMs();
 
+int trySyncPendingEvents();
+
+void handleSetAlertConfig();
+
 const char* DEVICE_ID = "esp32_noise_01";
 
 const char* SUPABASE_URL = "https://dprqmezzvncftaoksauz.supabase.co";
@@ -139,6 +143,16 @@ const char* SUPABASE_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ
 
 const unsigned long SUPABASE_SYNC_INTERVAL_MS = 3000;
 unsigned long lastSupabaseSyncTime = 0;
+
+const unsigned long SYNC_RETRY_BACKOFF_MS = 30000;
+unsigned long lastSyncBackoffLogMs = 0;
+const unsigned long SYNC_IO_LOG_INTERVAL_MS = 10000;
+unsigned long lastSyncIoLogMs = 0;
+
+unsigned long nextSupabaseSyncAllowedMs = 0;
+int lastPendingCountLogged = -9999;
+unsigned long lastPendingLogMs = 0;
+const unsigned long PENDING_LOG_INTERVAL_MS = 30000;
 
 const char* PENDING_EVENTS_PATH = "/pending_events.txt";
 
@@ -231,6 +245,8 @@ bool serialLoggingEnabled = true;
 bool sdAvailable = true;
 unsigned long lastSdCheckMs = 0;
 unsigned long lastSdFailMs = 0;
+bool sdInitOk = false;
+unsigned long lastSdBeginAttemptMs = 0;
 
 unsigned long lastSupabaseFailMs = 0;
 unsigned long lastSupabaseOkMs = 0;
@@ -306,6 +322,18 @@ bool majorLogged = false;
 unsigned long lastLogTime = 0;
 LedState currentState = GREEN;
 
+unsigned long majorRepeatIntervalMs = 180000;
+unsigned long silenceResetWindowMs = 15000;
+
+unsigned long firstWarningTimeMs = FIRST_WARNING_TIME;
+unsigned long secondWarningTimeMs = SECOND_WARNING_TIME;
+unsigned long majorWarningTimeMs = MAJOR_WARNING_TIME;
+
+unsigned long lastMajorAlertMs = 0;
+unsigned long silenceBelowRedStartMs = 0;
+
+String currentViolationGroupId = "";
+
 String ledStateToString(LedState s) {
   switch (s) {
     case GREEN: return "GREEN";
@@ -357,8 +385,13 @@ bool enqueuePendingEvent(const String &line) {
 }
 
 bool sdReady() {
+  unsigned long now = millis();
+  if (sdInitOk) return true;
+  if ((lastSdBeginAttemptMs != 0) && (now - lastSdBeginAttemptMs < SYNC_RETRY_BACKOFF_MS)) return false;
+  lastSdBeginAttemptMs = now;
   if (!SD.begin(SD_CS, SPI, 1000000)) return false;
-  return SD.cardType() != CARD_NONE;
+  sdInitOk = (SD.cardType() != CARD_NONE);
+  return sdInitOk;
 }
 
 uint64_t getEpochMs() {
@@ -500,7 +533,14 @@ void logSupabaseStatus(const String &line) {
 }
 
 int countPendingEventsOnSD() {
-  if (!sdReady()) return -1;
+  unsigned long now = millis();
+  if (!sdAvailable && (lastSdFailMs != 0) && (now - lastSdFailMs < SYNC_RETRY_BACKOFF_MS)) return -1;
+  if (!sdReady()) {
+    sdAvailable = false;
+    lastSdFailMs = now;
+    return -1;
+  }
+  if (!SD.exists(PENDING_EVENTS_PATH)) return 0;
   File f = SD.open(PENDING_EVENTS_PATH, FILE_READ);
   if (!f) return 0;
   int count = 0;
@@ -582,11 +622,13 @@ String makeStorageObjectPath(const String &eventId) {
 }
 
 String makePublicStorageUrl(const String &objectPath) {
-  return String(SUPABASE_URL) + "/storage/v1/object/public/records/" + objectPath;
+  return String(SUPABASE_URL) + "/storage/v1/object/public/recordings/" + objectPath;
 }
 
 bool sendNoiseEventToSupabase(
   const String &eventId,
+  uint64_t eventTsMs,
+  const String &groupId,
   const String &warningLevel,
   int durationSeconds,
   int decibel,
@@ -614,11 +656,15 @@ bool sendNoiseEventToSupabase(
   body.reserve(512);
   body += "{";
   body += "\"id\":\"" + eventId + "\",";
+  body += "\"event_group_id\":\"" + groupId + "\",";
   body += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
   body += "\"warning_level\":\"" + warningLevel + "\",";
   body += "\"warning_color\":\"RED\",";
   body += "\"duration_seconds\":" + String(durationSeconds) + ",";
   body += "\"decibel\":" + String(decibel) + ",";
+  if (eventTsMs != 0) {
+    body += "\"event_ts_ms\":" + String((unsigned long long)eventTsMs) + ",";
+  }
   if (audioUrl.length() > 0) {
     body += "\"audio_url\":\"" + audioUrl + "\",";
   }
@@ -668,11 +714,13 @@ bool sendNoiseEventToSupabase(
   return true;
 }
 
-void queueRedWarningEvent(const String &warningLevel, int durationSeconds, int decibel, bool audioRecorded, const String &audioLocalPath) {
+void queueRedWarningEvent(const String &warningLevel, uint64_t eventTsMs, const String &groupId, int durationSeconds, int decibel, bool audioRecorded, const String &audioLocalPath) {
   String eventId = genUuidV4();
   String line;
   line.reserve(256);
   line += eventId;
+  line += "|";
+  line += groupId;
   line += "|";
   line += warningLevel;
   line += "|";
@@ -685,6 +733,8 @@ void queueRedWarningEvent(const String &warningLevel, int durationSeconds, int d
   line += (audioRecorded ? "1" : "0");
   line += "|";
   line += audioLocalPath;
+  line += "|";
+  line += String((unsigned long long)eventTsMs);
 
   if (!sdReady()) {
     logSupabaseStatus(getTimeString() + " | Queue FAIL (SD not available) | " + eventId);
@@ -709,9 +759,16 @@ void queueRedWarningEvent(const String &warningLevel, int durationSeconds, int d
   }
   logSupabaseStatus(msg);
 
+  // Immediate sync when online (may block briefly); batching below reduces repeated overhead.
   if (wifiConnected && supabaseConfigured()) {
-    logSupabaseStatus(getTimeString() + " | Attempting immediate sync | " + eventId);
-    trySyncPendingEvents();
+    if (millis() >= nextSupabaseSyncAllowedMs) {
+      int uploaded = trySyncPendingEvents();
+      if (uploaded > 0) {
+        nextSupabaseSyncAllowedMs = millis();
+      } else {
+        nextSupabaseSyncAllowedMs = millis() + SYNC_RETRY_BACKOFF_MS;
+      }
+    }
   }
 }
 
@@ -781,34 +838,78 @@ void handleScanNetworks() {
   server.send(200, "application/json", lastScanJson);
 }
 
-void trySyncPendingEvents() {
-  if (!wifiConnected) return;
+int trySyncPendingEvents() {
+  if (!wifiConnected) return 0;
+
+  unsigned long now = millis();
+  if (!sdAvailable && (lastSdFailMs != 0) && (now - lastSdFailMs < SYNC_RETRY_BACKOFF_MS)) {
+    if ((lastSyncBackoffLogMs == 0) || (now - lastSyncBackoffLogMs >= SYNC_RETRY_BACKOFF_MS)) {
+      lastSyncBackoffLogMs = now;
+      logSupabaseStatus(getTimeString() + " | Supabase sync delayed: SD backoff 30s");
+    }
+    return 0;
+  }
+
   if (!sdReady()) {
     logSupabaseStatus(getTimeString() + " | Supabase sync skipped: SD not available");
     sdAvailable = false;
-    lastSdFailMs = millis();
-    return;
+    lastSdFailMs = now;
+    return 0;
   }
-  if (!supabaseConfigured()) return;
+  if (!supabaseConfigured()) return 0;
 
-  unsigned long startMs = millis();
-  const unsigned long maxWorkMs = 250;
+  unsigned long startMs = 0;
+  const unsigned long maxWorkMs = 1200;
   int okCount = 0;
+  int processedCount = 0;
+  bool loggedFirstLine = false;
+  bool logThisAttempt = false;
+  const int maxEventsThisAttempt = 12;
 
   File in = SD.open(PENDING_EVENTS_PATH, FILE_READ);
-  if (!in) return;
+  if (!in) {
+    if (!SD.exists(PENDING_EVENTS_PATH)) return 0;
+    if ((lastSyncIoLogMs == 0) || (now - lastSyncIoLogMs >= SYNC_IO_LOG_INTERVAL_MS)) {
+      lastSyncIoLogMs = now;
+      logSupabaseStatus(getTimeString() + " | Supabase sync skipped: cannot open pending_events.txt (read)");
+    }
+    return 0;
+  }
+
+  in.seek(0);
+
+  SD.remove("/pending_events_tmp.txt");
 
   File out = SD.open("/pending_events_tmp.txt", FILE_WRITE);
   if (!out) {
     in.close();
-    return;
+    if ((lastSyncIoLogMs == 0) || (now - lastSyncIoLogMs >= SYNC_IO_LOG_INTERVAL_MS)) {
+      lastSyncIoLogMs = now;
+      logSupabaseStatus(getTimeString() + " | Supabase sync skipped: cannot open pending_events_tmp.txt (write)");
+    }
+    return 0;
   }
+
+  logThisAttempt = ((lastSyncIoLogMs == 0) || (now - lastSyncIoLogMs >= SYNC_IO_LOG_INTERVAL_MS));
+  if (logThisAttempt) {
+    lastSyncIoLogMs = now;
+    logSupabaseStatus(getTimeString() + " | Supabase sync started | pending_size=" + String((unsigned long)in.size()) + " | avail=" + String((int)in.available()));
+  }
+
+  if (in.size() == 0) {
+    in.close();
+    out.close();
+    SD.remove("/pending_events_tmp.txt");
+    return 0;
+  }
+
+  startMs = millis();
 
   while (in.available()) {
     server.handleClient();
     yield();
 
-    if (millis() - startMs > maxWorkMs) {
+    if ((processedCount > 0) && (millis() - startMs > maxWorkMs)) {
       while (in.available()) {
         String rest = in.readStringUntil('\n');
         rest.trim();
@@ -821,42 +922,167 @@ void trySyncPendingEvents() {
     line.trim();
     if (line.length() == 0) continue;
 
-    int p1 = line.indexOf('|');
-    int p2 = line.indexOf('|', p1 + 1);
-    int p3 = line.indexOf('|', p2 + 1);
-    int p4 = line.indexOf('|', p3 + 1);
-    int p5 = line.indexOf('|', p4 + 1);
-    int p6 = line.indexOf('|', p5 + 1);
+    if (!loggedFirstLine && logThisAttempt) {
+      logSupabaseStatus(getTimeString() + " | Supabase sync first_line=" + truncateForLog(line, 160));
+      loggedFirstLine = true;
+    }
 
-    if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0 || p5 < 0 || p6 < 0) {
+    // Parse pending line (backward compatible)
+    String fields[10];
+    int fieldCount = 0;
+    int start = 0;
+    while (fieldCount < 10) {
+      int sep = line.indexOf('|', start);
+      if (sep < 0) {
+        fields[fieldCount++] = line.substring(start);
+        break;
+      }
+      fields[fieldCount++] = line.substring(start, sep);
+      start = sep + 1;
+    }
+    if (fieldCount < 7) {
       out.println(line);
       continue;
     }
 
-    String eventId = line.substring(0, p1);
-    String warningLevel = line.substring(p1 + 1, p2);
-    int durationSeconds = line.substring(p2 + 1, p3).toInt();
-    int decibel = line.substring(p3 + 1, p4).toInt();
-    bool buzzerTriggered = (line.substring(p4 + 1, p5) == "1");
-    bool audioRecorded = (line.substring(p5 + 1, p6) == "1");
-    String audioLocalPath = line.substring(p6 + 1);
+    // Old: 7 fields => id, level, dur, db, buz, audio, path
+    // New: 8 fields => id, groupId, level, dur, db, buz, audio, path
+    // New+: 9 fields => id, groupId, level, dur, db, buz, audio, path, eventTsMs
+    String eventId;
+    uint64_t eventTsMs = 0;
+    String groupId;
+    String warningLevel;
+    int durationSeconds = 0;
+    int decibel = 0;
+    bool buzzerTriggered = false;
+    bool audioRecorded = false;
+    String audioLocalPath;
 
-    bool ok = sendNoiseEventToSupabase(eventId, warningLevel, durationSeconds, decibel, buzzerTriggered, audioRecorded, audioLocalPath);
-    if (!ok) {
-      logSupabaseStatus(getTimeString() + " | Supabase sync FAIL (kept pending) | " + eventId);
-      markSupabaseFail();
-      out.println(line);
+    if (fieldCount == 7) {
+      eventId = fields[0];
+      groupId = eventId;
+      warningLevel = fields[1];
+      durationSeconds = fields[2].toInt();
+      decibel = fields[3].toInt();
+      buzzerTriggered = (fields[4] == "1");
+      audioRecorded = (fields[5] == "1");
+      audioLocalPath = fields[6];
     } else {
-      markSupabaseOk();
-      okCount++;
+      eventId = fields[0];
+      groupId = fields[1];
+      warningLevel = fields[2];
+      durationSeconds = fields[3].toInt();
+      decibel = fields[4].toInt();
+      buzzerTriggered = (fields[5] == "1");
+      audioRecorded = (fields[6] == "1");
+      audioLocalPath = fields[7];
+      if (fieldCount >= 9) {
+        eventTsMs = (uint64_t)strtoull(fields[8].c_str(), NULL, 10);
+      }
+    }
+
+    processedCount++;
+    if (processedCount == 1) {
+      logSupabaseStatus(getTimeString() + " | Supabase sync processing | id=" + eventId + " | audio=" + String(audioRecorded ? "1" : "0"));
+    }
+
+    if (!audioRecorded) {
+      // Add to bulk batch
+      if (!batchHasAny) {
+        batchJson = "";
+        batchHasAny = true;
+      }
+      if (batchCount > 0) batchJson += ",";
+      String obj;
+      obj.reserve(220);
+      obj += "{";
+      obj += "\"id\":\"" + eventId + "\",";
+      obj += "\"event_group_id\":\"" + groupId + "\",";
+      obj += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
+      obj += "\"warning_level\":\"" + warningLevel + "\",";
+      obj += "\"warning_color\":\"RED\",";
+      obj += "\"duration_seconds\":" + String(durationSeconds) + ",";
+      obj += "\"decibel\":" + String(decibel) + ",";
+      if (eventTsMs != 0) {
+        obj += "\"event_ts_ms\":" + String((unsigned long long)eventTsMs) + ",";
+      }
+      obj += "\"buzzer_triggered\":" + String(buzzerTriggered ? "true" : "false") + ",";
+      obj += "\"audio_recorded\":false";
+      obj += "}";
+      batchJson += obj;
+      if (batchLineCount < batchMax) batchLines[batchLineCount++] = line;
+      batchCount++;
+
+      if (batchCount >= batchMax) {
+        flushBatch();
+      }
+    } else {
+      // Flush any pending non-audio batch before uploading audio
+      flushBatch();
+
+      unsigned long httpStartMs = millis();
+      if (processedCount == 1) {
+        logSupabaseStatus(getTimeString() + " | Supabase sync HTTP begin | id=" + eventId);
+      }
+      bool ok = sendNoiseEventToSupabase(eventId, eventTsMs, groupId, warningLevel, durationSeconds, decibel, buzzerTriggered, audioRecorded, audioLocalPath);
+      if (processedCount == 1) {
+        logSupabaseStatus(getTimeString() + " | Supabase sync HTTP end | id=" + eventId + " | ok=" + String(ok ? "1" : "0") + " | ms=" + String((unsigned long)(millis() - httpStartMs)));
+      }
+      if (!ok) {
+        logSupabaseStatus(getTimeString() + " | Supabase sync FAIL (kept pending) | " + eventId);
+        markSupabaseFail();
+        out.println(line);
+      } else {
+        markSupabaseOk();
+        okCount++;
+      }
+    }
+
+    if (processedCount >= maxEventsThisAttempt) {
+      while (in.available()) {
+        String rest = in.readStringUntil('\n');
+        rest.trim();
+        if (rest.length() > 0) out.println(rest);
+      }
+      break;
     }
   }
+
+  // Flush any remaining non-audio batch
+  flushBatch();
 
   in.close();
   out.close();
 
-  SD.remove(PENDING_EVENTS_PATH);
-  SD.rename("/pending_events_tmp.txt", PENDING_EVENTS_PATH);
+  bool hadOld = SD.exists(PENDING_EVENTS_PATH);
+  if (hadOld) {
+    SD.remove("/pending_events_old.txt");
+    SD.rename(PENDING_EVENTS_PATH, "/pending_events_old.txt");
+  }
+
+  if (!SD.rename("/pending_events_tmp.txt", PENDING_EVENTS_PATH)) {
+    if ((lastSyncIoLogMs == 0) || (now - lastSyncIoLogMs >= SYNC_IO_LOG_INTERVAL_MS)) {
+      lastSyncIoLogMs = now;
+      logSupabaseStatus(getTimeString() + " | Supabase sync WARNING: rename tmp->pending failed");
+    }
+    if (SD.exists("/pending_events_old.txt")) {
+      SD.rename("/pending_events_old.txt", PENDING_EVENTS_PATH);
+    }
+  } else {
+    SD.remove("/pending_events_old.txt");
+  }
+
+  if (processedCount == 0) {
+    if (logThisAttempt) {
+      logSupabaseStatus(getTimeString() + " | Supabase sync ended | no_lines_processed");
+    }
+  }
+
+  if (okCount > 0) {
+    logSupabaseStatus(getTimeString() + " | Supabase sync OK | uploaded=" + String(okCount));
+  }
+
+  return okCount;
 }
 
 void appendEventLog(const String &line) {
@@ -904,6 +1130,13 @@ void loadDeviceSettings() {
   speakerEnabled = preferences.getBool("speaker", speakerEnabled);
   mp3Volume = preferences.getInt("mp3vol", mp3Volume);
 
+  majorRepeatIntervalMs = (unsigned long)preferences.getInt("maj_int", (int)majorRepeatIntervalMs);
+  silenceResetWindowMs = (unsigned long)preferences.getInt("sil_win", (int)silenceResetWindowMs);
+
+  firstWarningTimeMs = (unsigned long)preferences.getInt("fw_ms", (int)firstWarningTimeMs);
+  secondWarningTimeMs = (unsigned long)preferences.getInt("sw_ms", (int)secondWarningTimeMs);
+  majorWarningTimeMs = (unsigned long)preferences.getInt("mw_ms", (int)majorWarningTimeMs);
+
   noiseGreenBrt = preferences.getInt("ngbrt", noiseGreenBrt);
   noiseYellowBrt = preferences.getInt("nybrt", noiseYellowBrt);
   noiseRedBrt = preferences.getInt("nrbrt", noiseRedBrt);
@@ -939,6 +1172,17 @@ void loadDeviceSettings() {
   dbChangeThreshold10 = constrain(dbChangeThreshold10, 1, 200);
   dbHeartbeatMs = constrain(dbHeartbeatMs, (unsigned long)1000, (unsigned long)600000);
   dbBulkUploadIntervalMs = constrain(dbBulkUploadIntervalMs, (unsigned long)60000, (unsigned long)86400000);
+
+  majorRepeatIntervalMs = constrain(majorRepeatIntervalMs, (unsigned long)60000, (unsigned long)1800000);
+  silenceResetWindowMs = constrain(silenceResetWindowMs, (unsigned long)5000, (unsigned long)120000);
+
+  firstWarningTimeMs = constrain(firstWarningTimeMs, (unsigned long)1000, (unsigned long)30000);
+  secondWarningTimeMs = constrain(secondWarningTimeMs, (unsigned long)2000, (unsigned long)120000);
+  majorWarningTimeMs = constrain(majorWarningTimeMs, (unsigned long)5000, (unsigned long)600000);
+  if (secondWarningTimeMs <= firstWarningTimeMs) secondWarningTimeMs = firstWarningTimeMs + 1000UL;
+  if (majorWarningTimeMs <= secondWarningTimeMs) majorWarningTimeMs = secondWarningTimeMs + 1000UL;
+
+  if (RED_THRESHOLD <= YELLOW_THRESHOLD) RED_THRESHOLD = constrain(YELLOW_THRESHOLD + 1, 0, 100);
   preferences.end();
 }
 
@@ -948,6 +1192,13 @@ void saveDeviceSettings() {
   preferences.putInt("red", RED_THRESHOLD);
   preferences.putBool("speaker", speakerEnabled);
   preferences.putInt("mp3vol", mp3Volume);
+
+  preferences.putInt("maj_int", (int)majorRepeatIntervalMs);
+  preferences.putInt("sil_win", (int)silenceResetWindowMs);
+
+  preferences.putInt("fw_ms", (int)firstWarningTimeMs);
+  preferences.putInt("sw_ms", (int)secondWarningTimeMs);
+  preferences.putInt("mw_ms", (int)majorWarningTimeMs);
 
   preferences.putInt("ngbrt", noiseGreenBrt);
   preferences.putInt("nybrt", noiseYellowBrt);
@@ -989,13 +1240,16 @@ void markSupabaseOk() {
 }
 
 void updateSdAvailability(unsigned long now) {
-  const unsigned long SD_CHECK_MS = 10000;
+  const unsigned long SD_CHECK_MS = 30000;
   if (now - lastSdCheckMs < SD_CHECK_MS) return;
   lastSdCheckMs = now;
   bool ok = sdReady();
   bool prev = sdAvailable;
   sdAvailable = ok;
-  if (!ok) lastSdFailMs = now;
+  if (!ok) {
+    lastSdFailMs = now;
+    sdInitOk = false;
+  }
   if (prev != ok) {
     appendEventLog(getTimeString() + String(ok ? " | SD card OK" : " | SD card NOT available"));
   }
@@ -1344,6 +1598,11 @@ void handleStatus() {
   out += "\"apip\":\"" + WiFi.softAPIP().toString() + "\",";
   out += "\"yellow\":" + String(YELLOW_THRESHOLD) + ",";
   out += "\"red\":" + String(RED_THRESHOLD) + ",";
+  out += "\"fw_ms\":" + String(firstWarningTimeMs) + ",";
+  out += "\"sw_ms\":" + String(secondWarningTimeMs) + ",";
+  out += "\"mw_ms\":" + String(majorWarningTimeMs) + ",";
+  out += "\"maj_int\":" + String(majorRepeatIntervalMs) + ",";
+  out += "\"sil_win\":" + String(silenceResetWindowMs) + ",";
   out += "\"ngbrt\":" + String(noiseGreenBrt) + ",";
   out += "\"nybrt\":" + String(noiseYellowBrt) + ",";
   out += "\"nrbrt\":" + String(noiseRedBrt) + ",";
@@ -1374,6 +1633,53 @@ void handleStatus() {
   out += "\"mp3tferr\":" + String((mp3Available && !mp3TfOnline) ? "true" : "false");
   out += "}";
   server.send(200, "application/json", out);
+}
+
+void handleSetAlertConfig() {
+  unsigned long prevMaj = majorRepeatIntervalMs;
+  unsigned long prevSil = silenceResetWindowMs;
+  unsigned long prevFw = firstWarningTimeMs;
+  unsigned long prevSw = secondWarningTimeMs;
+  unsigned long prevMw = majorWarningTimeMs;
+
+  if (server.hasArg("maj_min")) {
+    long v = server.arg("maj_min").toInt();
+    if (v > 0) majorRepeatIntervalMs = (unsigned long)v * 60000UL;
+  }
+  if (server.hasArg("sil_sec")) {
+    long v = server.arg("sil_sec").toInt();
+    if (v > 0) silenceResetWindowMs = (unsigned long)v * 1000UL;
+  }
+
+  if (server.hasArg("first_sec")) {
+    long v = server.arg("first_sec").toInt();
+    if (v > 0) firstWarningTimeMs = (unsigned long)v * 1000UL;
+  }
+  if (server.hasArg("second_sec")) {
+    long v = server.arg("second_sec").toInt();
+    if (v > 0) secondWarningTimeMs = (unsigned long)v * 1000UL;
+  }
+  if (server.hasArg("major_sec")) {
+    long v = server.arg("major_sec").toInt();
+    if (v > 0) majorWarningTimeMs = (unsigned long)v * 1000UL;
+  }
+
+  majorRepeatIntervalMs = constrain(majorRepeatIntervalMs, (unsigned long)60000, (unsigned long)1800000);
+  silenceResetWindowMs = constrain(silenceResetWindowMs, (unsigned long)5000, (unsigned long)120000);
+
+  firstWarningTimeMs = constrain(firstWarningTimeMs, (unsigned long)1000, (unsigned long)30000);
+  secondWarningTimeMs = constrain(secondWarningTimeMs, (unsigned long)2000, (unsigned long)120000);
+  majorWarningTimeMs = constrain(majorWarningTimeMs, (unsigned long)5000, (unsigned long)600000);
+  if (secondWarningTimeMs <= firstWarningTimeMs) secondWarningTimeMs = firstWarningTimeMs + 1000UL;
+  if (majorWarningTimeMs <= secondWarningTimeMs) majorWarningTimeMs = secondWarningTimeMs + 1000UL;
+
+  saveDeviceSettings();
+  if (majorRepeatIntervalMs != prevMaj) appendEventLog(getTimeString() + " | Major repeat min=" + String((int)(majorRepeatIntervalMs / 60000UL)));
+  if (silenceResetWindowMs != prevSil) appendEventLog(getTimeString() + " | Silence reset sec=" + String((int)(silenceResetWindowMs / 1000UL)));
+  if (firstWarningTimeMs != prevFw) appendEventLog(getTimeString() + " | First warning sec=" + String((int)(firstWarningTimeMs / 1000UL)));
+  if (secondWarningTimeMs != prevSw) appendEventLog(getTimeString() + " | Second warning sec=" + String((int)(secondWarningTimeMs / 1000UL)));
+  if (majorWarningTimeMs != prevMw) appendEventLog(getTimeString() + " | Major warning sec=" + String((int)(majorWarningTimeMs / 1000UL)));
+  server.send(204);
 }
 
 void handleSetLedBrightness() {
@@ -1558,7 +1864,19 @@ void handleSetThresholds() {
   if (server.hasArg("red"))
     RED_THRESHOLD = constrain(server.arg("red").toInt(), 0, 100);
 
+  if (RED_THRESHOLD <= YELLOW_THRESHOLD) {
+    RED_THRESHOLD = constrain(YELLOW_THRESHOLD + 1, 0, 100);
+  }
+
   saveDeviceSettings();
+
+  updateLEDState((int)smoothDB);
+
+  if ((int)smoothDB < RED_THRESHOLD) {
+    silenceBelowRedStartMs = millis();
+  } else {
+    silenceBelowRedStartMs = 0;
+  }
 
   if (YELLOW_THRESHOLD != prevY) appendEventLog(getTimeString() + " | Yellow threshold=" + String(YELLOW_THRESHOLD));
   if (RED_THRESHOLD != prevR) appendEventLog(getTimeString() + " | Red threshold=" + String(RED_THRESHOLD));
@@ -1743,7 +2061,7 @@ bool recordINMP441Wav5s() {
   const uint32_t sampleRate = 16000;
   const uint16_t bitsPerSample = 16;
   const uint16_t channels = 1;
-  const uint32_t durationMs = 50000;
+  const uint32_t durationMs = 5000;
   const uint32_t totalSamples = (sampleRate * durationMs) / 1000;
   const uint32_t targetDataBytes = totalSamples * channels * (bitsPerSample / 8);
 
@@ -1842,6 +2160,7 @@ void setup() {
   server.on("/scan", handleScanNetworks);
   server.on("/status", handleStatus);
   server.on("/setThresholds", handleSetThresholds);
+  server.on("/setAlertConfig", handleSetAlertConfig);
   server.on("/toggleSpeaker", handleToggleSpeaker);
   server.on("/setSpeaker", handleSetSpeaker);
   server.on("/disconnect", handleDisconnect);
@@ -2002,20 +2321,36 @@ void loop() {
   if (now - lastSupabaseSyncTime >= SUPABASE_SYNC_INTERVAL_MS) {
     if (!wifiConnected) {
       int pending = countPendingEventsOnSD();
-      if (pending > 0) {
-        logSupabaseStatus(getTimeString() + " | Supabase sync skipped: offline | pending=" + String(pending));
+      if (pending >= 0 && (pending != lastPendingCountLogged || (lastPendingLogMs == 0) || (now - lastPendingLogMs >= PENDING_LOG_INTERVAL_MS))) {
+        lastPendingCountLogged = pending;
+        lastPendingLogMs = now;
+        if (pending > 0) logSupabaseStatus(getTimeString() + " | Supabase sync skipped: offline | pending=" + String(pending));
       }
     } else if (!supabaseConfigured()) {
       int pending = countPendingEventsOnSD();
-      if (pending > 0) {
-        logSupabaseStatus(getTimeString() + " | Supabase sync skipped: not configured | pending=" + String(pending));
+      if (pending >= 0 && (pending != lastPendingCountLogged || (lastPendingLogMs == 0) || (now - lastPendingLogMs >= PENDING_LOG_INTERVAL_MS))) {
+        lastPendingCountLogged = pending;
+        lastPendingLogMs = now;
+        if (pending > 0) logSupabaseStatus(getTimeString() + " | Supabase sync skipped: not configured | pending=" + String(pending));
       }
     } else {
-      int pending = countPendingEventsOnSD();
-      if (pending > 0) {
-        logSupabaseStatus(getTimeString() + " | Supabase sync tick | pending=" + String(pending));
+      if (now >= nextSupabaseSyncAllowedMs) {
+        int pending = countPendingEventsOnSD();
+        if (pending >= 0 && (pending != lastPendingCountLogged || (lastPendingLogMs == 0) || (now - lastPendingLogMs >= PENDING_LOG_INTERVAL_MS))) {
+          lastPendingCountLogged = pending;
+          lastPendingLogMs = now;
+          if (pending > 0) logSupabaseStatus(getTimeString() + " | Supabase sync tick | pending=" + String(pending));
+        }
+
+        if (pending > 0) {
+          int uploaded = trySyncPendingEvents();
+          if (uploaded > 0) {
+            nextSupabaseSyncAllowedMs = now;
+          } else {
+            nextSupabaseSyncAllowedMs = now + SYNC_RETRY_BACKOFF_MS;
+          }
+        }
       }
-      trySyncPendingEvents();
     }
     lastSupabaseSyncTime = now;
   }
@@ -2139,12 +2474,14 @@ int getMovingAverage(int value) {
 void updateLEDState(int value) {
   switch (currentState) {
     case GREEN:
-      if (value > YELLOW_THRESHOLD + HYSTERESIS_DB)
+      if (value >= RED_THRESHOLD)
+        currentState = RED;
+      else if (value >= YELLOW_THRESHOLD)
         currentState = YELLOW;
       break;
 
     case YELLOW:
-      if (value > RED_THRESHOLD + HYSTERESIS_DB)
+      if (value >= RED_THRESHOLD)
         currentState = RED;
       else if (value < YELLOW_THRESHOLD - HYSTERESIS_DB)
         currentState = GREEN;
@@ -2162,37 +2499,64 @@ void updateLEDState(int value) {
 // ================= WARNING LOGIC =================
 void handleRedWarnings(int value, unsigned long now) {
   if (value >= RED_THRESHOLD) {
+    silenceBelowRedStartMs = 0;
     if (redStartTime == 0) {
       redStartTime = now;
       firstLogged = secondLogged = majorLogged = false;
+      lastMajorAlertMs = 0;
+      currentViolationGroupId = genUuidV4();
     }
 
     unsigned long d = now - redStartTime;
-    if (d >= FIRST_WARNING_TIME && !firstLogged) {
-      logEvent("FIRST WARNING (RED 5s)");
+    int elapsedSeconds = (int)(d / 1000UL);
+    int firstCfgSec = (int)(firstWarningTimeMs / 1000UL);
+    int secondCfgSec = (int)(secondWarningTimeMs / 1000UL);
+    int majorCfgSec = (int)(majorWarningTimeMs / 1000UL);
+    if (d >= firstWarningTimeMs && !firstLogged) {
+      uint64_t tsMs = getEpochMs();
+      logEvent(String("FIRST WARNING (RED ") + String(firstCfgSec) + "s)");
       flickerActiveLed();
       playMP3(0x01);     // 001.mp3
-      queueRedWarningEvent("FIRST", 5, value, false, "");
+      queueRedWarningEvent("FIRST", tsMs, currentViolationGroupId, firstCfgSec, value, false, "");
       firstLogged = true;
     }
-    if (d >= SECOND_WARNING_TIME && !secondLogged) {
-      logEvent("SECOND WARNING (RED 30s)");
+    if (d >= secondWarningTimeMs && !secondLogged) {
+      uint64_t tsMs = getEpochMs();
+      logEvent(String("SECOND WARNING (RED ") + String(secondCfgSec) + "s)");
       flickerActiveLed();
       playMP3(0x02);     // 002.mp3
-      queueRedWarningEvent("SECOND", 30, value, false, "");
+      queueRedWarningEvent("SECOND", tsMs, currentViolationGroupId, secondCfgSec, value, false, "");
       secondLogged = true;
     }
-    if (d >= MAJOR_WARNING_TIME && !majorLogged) {
-      logEvent("MAJOR WARNING (RED 60s)");
+    if (d >= majorWarningTimeMs && !majorLogged) {
+      uint64_t tsMs = getEpochMs();
+      logEvent(String("MAJOR WARNING (RED ") + String(majorCfgSec) + "s)");
       flickerActiveLed();
       recordINMP441Wav5s();
       playMP3(0x03);     // 003.mp3
-      queueRedWarningEvent("MAJOR", 60, value, true, lastRecordedWavPath);
+      queueRedWarningEvent("MAJOR", tsMs, currentViolationGroupId, majorCfgSec, value, true, lastRecordedWavPath);
       majorLogged = true;
+      lastMajorAlertMs = now;
+    }
+
+    if (majorLogged && lastMajorAlertMs != 0 && (now - lastMajorAlertMs >= majorRepeatIntervalMs)) {
+      uint64_t tsMs = getEpochMs();
+      logEvent("MAJOR WARNING (REPEAT)");
+      flickerActiveLed();
+      recordINMP441Wav5s();
+      playMP3(0x03);
+      queueRedWarningEvent("MAJOR", tsMs, currentViolationGroupId, elapsedSeconds, value, true, lastRecordedWavPath);
+      lastMajorAlertMs = now;
     }
   } else {
-    redStartTime = 0;
-    firstLogged = secondLogged = majorLogged = false;
+    if (silenceBelowRedStartMs == 0) silenceBelowRedStartMs = now;
+    if (now - silenceBelowRedStartMs >= silenceResetWindowMs) {
+      redStartTime = 0;
+      firstLogged = secondLogged = majorLogged = false;
+      lastMajorAlertMs = 0;
+      silenceBelowRedStartMs = 0;
+      currentViolationGroupId = "";
+    }
   }
 }
 

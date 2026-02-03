@@ -150,8 +150,29 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
           <label>Red Threshold</label>
           <input id="red" type="number" min="0" max="100" />
         </div>
+        <div>
+          <label>Major Repeat (minutes)</label>
+          <input id="maj_min" type="number" min="1" max="30" step="1" />
+        </div>
+        <div>
+          <label>Silence Reset (seconds)</label>
+          <input id="sil_sec" type="number" min="5" max="120" step="1" />
+        </div>
+        <div>
+          <label>First Warning (seconds)</label>
+          <input id="first_sec" type="number" min="1" max="30" step="1" />
+        </div>
+        <div>
+          <label>Second Warning (seconds)</label>
+          <input id="second_sec" type="number" min="2" max="120" step="1" />
+        </div>
+        <div>
+          <label>Major Warning (seconds)</label>
+          <input id="major_sec" type="number" min="5" max="600" step="1" />
+        </div>
         <div class="row">
           <button class="btn" id="saveThreshBtn">Save Thresholds</button>
+          <button class="btn gray" id="saveAlertBtn">Save Alert Timers</button>
           <button class="btn gray" id="speakerBtn">Toggle Speaker</button>
         </div>
         <div class="pill" id="speakerPill">Speaker: ...</div>
@@ -655,6 +676,11 @@ async function refreshUI() {
 
   safeSetValue('yellow', (typeof st.yellow === 'number') ? st.yellow : '');
   safeSetValue('red', (typeof st.red === 'number') ? st.red : '');
+  if (typeof st.maj_int === 'number') safeSetValue('maj_min', String(Math.max(1, Math.round(st.maj_int / 60000))));
+  if (typeof st.sil_win === 'number') safeSetValue('sil_sec', String(Math.max(5, Math.round(st.sil_win / 1000))));
+  if (typeof st.fw_ms === 'number') safeSetValue('first_sec', String(Math.max(1, Math.round(st.fw_ms / 1000))));
+  if (typeof st.sw_ms === 'number') safeSetValue('second_sec', String(Math.max(2, Math.round(st.sw_ms / 1000))));
+  if (typeof st.mw_ms === 'number') safeSetValue('major_sec', String(Math.max(5, Math.round(st.mw_ms / 1000))));
   document.getElementById('speakerPill').textContent = 'Speaker: ' + (st.speaker ? 'ON' : 'OFF');
 
   const speakerBtn = document.getElementById('speakerBtn');
@@ -914,7 +940,27 @@ document.getElementById('saveThreshBtn').addEventListener('click', async () => {
   } catch (e) {
     msg.textContent = 'Save failed.';
   }
-  setBtnLoading(btn, false, 'Save Thresholds');
+  setTimeout(async () => { setBtnLoading(btn, false, 'Save Thresholds'); await refreshUI(); }, 900);
+});
+
+document.getElementById('saveAlertBtn').addEventListener('click', async () => {
+  const maj = document.getElementById('maj_min').value;
+  const sil = document.getElementById('sil_sec').value;
+  const fw = document.getElementById('first_sec').value;
+  const sw = document.getElementById('second_sec').value;
+  const mw = document.getElementById('major_sec').value;
+  const msg = document.getElementById('ctrlMsg');
+  const btn = document.getElementById('saveAlertBtn');
+  setBtnLoading(btn, true, 'Save Alert Timers');
+  msg.textContent = 'Saving...';
+  try {
+    await fetch('/setAlertConfig?maj_min=' + encodeURIComponent(maj) + '&sil_sec=' + encodeURIComponent(sil) +
+      '&first_sec=' + encodeURIComponent(fw) + '&second_sec=' + encodeURIComponent(sw) + '&major_sec=' + encodeURIComponent(mw));
+    msg.textContent = 'Saved.';
+  } catch (e) {
+    msg.textContent = 'Save failed.';
+  }
+  setTimeout(async () => { setBtnLoading(btn, false, 'Save Alert Timers'); await refreshUI(); }, 900);
 });
 
 document.getElementById('speakerBtn').addEventListener('click', async () => {
