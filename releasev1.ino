@@ -533,7 +533,15 @@ void logSupabaseStatus(const String &line) {
 }
 
 int countPendingEventsOnSD() {
+  static unsigned long lastCountMs = 0;
+  static int lastCount = -1;
+
   unsigned long now = millis();
+  const unsigned long COUNT_COOLDOWN_MS = 30000;
+  if (lastCountMs != 0 && (now - lastCountMs) < COUNT_COOLDOWN_MS && lastCount >= 0) {
+    return lastCount;
+  }
+
   if (!sdAvailable && (lastSdFailMs != 0) && (now - lastSdFailMs < SYNC_RETRY_BACKOFF_MS)) return -1;
   if (!sdReady()) {
     sdAvailable = false;
@@ -548,8 +556,11 @@ int countPendingEventsOnSD() {
     String line = f.readStringUntil('\n');
     line.trim();
     if (line.length() > 0) count++;
+    yield();
   }
   f.close();
+  lastCount = count;
+  lastCountMs = now;
   return count;
 }
 
@@ -1376,27 +1387,31 @@ void updateStatusLed(unsigned long now) {
 
   const int brt = constrain(statusLedBrt, 0, LEDC_MAX);
 
-  if (anyError) {
+  if (isBooting) {
+    if (staConnected) {
+      rgb = (((now / 500) % 2) == 0) ? statusRgbBoot : statusRgbWifiOk;
+    } else {
+      rgb = statusRgbBoot;
+    }
+    r = (((rgb >> 16) & 0xFF) * brt) / 255;
+    g = (((rgb >> 8) & 0xFF) * brt) / 255;
+    b = (((rgb) & 0xFF) * brt) / 255;
+    blink = true;
+    periodMs = 800;
+  } else if (anyError) {
     rgb = statusRgbOffline;
     r = (((rgb >> 16) & 0xFF) * brt) / 255;
     g = (((rgb >> 8) & 0xFF) * brt) / 255;
     b = (((rgb) & 0xFF) * brt) / 255;
     blink = true;
     periodMs = 1200;
-  } else if (isBooting) {
-    rgb = statusRgbBoot;
-    r = (((rgb >> 16) & 0xFF) * brt) / 255;
-    g = (((rgb >> 8) & 0xFF) * brt) / 255;
-    b = (((rgb) & 0xFF) * brt) / 255;
-    blink = true;
-    periodMs = 1200;
-  } else if (apEnabled && !staConnected && apGrace) {
+  } else if (apEnabled && !staConnected) {
     rgb = statusRgbAp;
     r = (((rgb >> 16) & 0xFF) * brt) / 255;
     g = (((rgb >> 8) & 0xFF) * brt) / 255;
     b = (((rgb) & 0xFF) * brt) / 255;
     blink = true;
-    periodMs = 300;
+    periodMs = 500;
   } else if (staConnected) {
     if (internetOk) {
       rgb = statusRgbWifiOk;
@@ -2008,7 +2023,7 @@ void handleNetworkConnection() {
     preferences.putString("password", networkPassword);
     preferences.end();
 
-    WiFi.disconnect(true);
+    WiFi.disconnect(false, false);
     delay(500);
     Serial.println(String("WiFi begin (manual save) SSID=") + networkSSID);
     WiFi.begin(networkSSID.c_str(), networkPassword.c_str());
@@ -2256,6 +2271,20 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  const bool staNowConnected = (WiFi.status() == WL_CONNECTED);
+  wifiConnected = staNowConnected;
+
+  static unsigned long lastLoopMs = 0;
+  static unsigned long lastLoopStallLogMs = 0;
+  if (lastLoopMs != 0) {
+    unsigned long dt = now - lastLoopMs;
+    if (dt > 1500 && ((lastLoopStallLogMs == 0) || (now - lastLoopStallLogMs > 5000))) {
+      lastLoopStallLogMs = now;
+      Serial.println(String("Loop stall ms=") + dt + " | WiFiMode=" + String((int)WiFi.getMode()) + " | sta=" + String((int)WiFi.status()));
+    }
+  }
+  lastLoopMs = now;
+
   while (mp3.available()) {
     (void)mp3.read();
     lastMp3RxMs = now;
@@ -2293,11 +2322,13 @@ void loop() {
 
   updateStatusLed(now);
 
-  // Keep cached flags in sync with real interface status
-  wifiConnected = (WiFi.status() == WL_CONNECTED);
-
-  if (wifiConnected && (now - lastInternetCheckMs >= INTERNET_CHECK_INTERVAL_MS)) {
+  if (staNowConnected && (now - lastInternetCheckMs >= INTERNET_CHECK_INTERVAL_MS)) {
+    unsigned long t0 = millis();
     internetOk = checkInternetNow();
+    unsigned long dt = millis() - t0;
+    if (dt > 1500) {
+      Serial.println(String("checkInternetNow stall ms=") + dt + " | sta=" + String((int)WiFi.status()));
+    }
     lastInternetCheckMs = now;
   }
 
@@ -2330,16 +2361,14 @@ void loop() {
         Serial.println("unknown");
       }
 
-      WiFi.mode(WIFI_AP_STA);
-      WiFi.softAP("ESP32_NOISE_Setup1", "12345678");
+      // Keep SoftAP stable; avoid restarting AP here.
+      if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
       logNetworkInfo("WiFi connect failed");
     }
   }
 
   if (!wifiConnected && !wifiConnecting && (networkSSID.length() > 0) && (now - lastWifiRetryMs >= WIFI_RETRY_INTERVAL_MS)) {
     lastWifiRetryMs = now;
-    WiFi.disconnect(true);
-    delay(200);
     Serial.println(String("WiFi begin (retry) SSID=") + networkSSID);
     WiFi.begin(networkSSID.c_str(), networkPassword.c_str());
     wifiConnecting = true;
@@ -2350,12 +2379,19 @@ void loop() {
   }
 
   if (now - lastSupabaseSyncTime >= SUPABASE_SYNC_INTERVAL_MS) {
-    if (!wifiConnected) {
-      int pending = countPendingEventsOnSD();
-      if (pending >= 0 && (pending != lastPendingCountLogged || (lastPendingLogMs == 0) || (now - lastPendingLogMs >= PENDING_LOG_INTERVAL_MS))) {
-        lastPendingCountLogged = pending;
-        lastPendingLogMs = now;
-        if (pending > 0) logSupabaseStatus(getTimeString() + " | Supabase sync skipped: offline | pending=" + String(pending));
+    if (!staNowConnected) {
+      if ((lastPendingLogMs == 0) || (now - lastPendingLogMs >= PENDING_LOG_INTERVAL_MS)) {
+        unsigned long t0 = millis();
+        int pending = countPendingEventsOnSD();
+        unsigned long dt = millis() - t0;
+        if (dt > 1500) {
+          Serial.println(String("countPendingEventsOnSD stall ms=") + dt);
+        }
+        if (pending >= 0 && (pending != lastPendingCountLogged || lastPendingLogMs == 0 || (now - lastPendingLogMs >= PENDING_LOG_INTERVAL_MS))) {
+          lastPendingCountLogged = pending;
+          lastPendingLogMs = now;
+          if (pending > 0) logSupabaseStatus(getTimeString() + " | Supabase sync skipped: offline | pending=" + String(pending));
+        }
       }
     } else if (!supabaseConfigured()) {
       int pending = countPendingEventsOnSD();
