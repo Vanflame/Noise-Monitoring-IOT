@@ -224,6 +224,13 @@ static const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(<!DOCTYPE html>
               <div class="pill">R: <span id="nrVal">80</span></div>
               <input id="nr" type="range" min="0" max="255" step="1" value="80" />
             </div>
+
+            <div class="row row-actions" style="margin-top:10px;">
+              <button class="btn gray" id="testLedG">Test Green</button>
+              <button class="btn gray" id="testLedY">Test Yellow</button>
+              <button class="btn gray" id="testLedR">Test Red</button>
+              <button class="btn gray" id="testLedOff">Off</button>
+            </div>
           </div>
 
           <div class="player" style="margin-top:10px;">
@@ -1066,6 +1073,26 @@ hookLedSlider('st', 'stVal', 'st');
 document.getElementById('nleden').addEventListener('change', async (e) => {
   const on = e.target.checked ? '1' : '0';
   try { await fetch('/setNoiseLedsEnabled?enabled=' + on); } catch (err) {}
+});
+
+async function testNoiseLed(btn, c) {
+  if (!btn) return;
+  setBtnLoading(btn, true, btn.textContent);
+  try { await fetch('/testNoiseLed?c=' + encodeURIComponent(c)); } catch (e) {}
+  setTimeout(() => setBtnLoading(btn, false, btn.textContent), 500);
+}
+
+document.getElementById('testLedG').addEventListener('click', async () => {
+  await testNoiseLed(document.getElementById('testLedG'), 'green');
+});
+document.getElementById('testLedY').addEventListener('click', async () => {
+  await testNoiseLed(document.getElementById('testLedY'), 'yellow');
+});
+document.getElementById('testLedR').addEventListener('click', async () => {
+  await testNoiseLed(document.getElementById('testLedR'), 'red');
+});
+document.getElementById('testLedOff').addEventListener('click', async () => {
+  await testNoiseLed(document.getElementById('testLedOff'), 'off');
 });
 
 document.getElementById('micen').addEventListener('change', async (e) => {

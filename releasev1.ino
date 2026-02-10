@@ -2,6 +2,7 @@
 #include <SD.h>
 #include <WiFi.h>
 #include <time.h>
+#include <Wire.h>
 #include <HardwareSerial.h>     // ✅ ADDED
 #include "types.h"
 #include "driver/i2s.h"
@@ -64,6 +65,15 @@ static inline void ledcWriteCompat(uint8_t channel, uint32_t duty) {
 // const char* defaultSsid = "HUAWEI-2.4G-Y66f";
 // const char* defaultPassword = "AuKN4N4w";
 
+static const uint8_t DS3231_I2C_ADDR = 0x68;
+static const int I2C_SDA_PIN = 32;
+static const int I2C_SCL_PIN = 4;
+
+bool rtcPresent = false;
+bool rtcTimeAppliedToSystem = false;
+bool rtcUpdatedFromSystem = false;
+unsigned long lastRtcPollMs = 0;
+
 String networkSSID = "";
 String networkPassword = "";
 
@@ -73,6 +83,9 @@ unsigned long wifiStartTime = 0;
 const unsigned long WIFI_TIMEOUT = 30000;
 unsigned long lastWifiRetryMs = 0;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 20000;
+unsigned long nextWifiRetryAllowedMs = 0;
+bool staSuppressed = false;
+unsigned long staSuppressedUntilMs = 0;
 String wifiStatusMessage = "Not connected";
 
 uint8_t lastStaDisconnectReason = 0;
@@ -117,6 +130,24 @@ void presetToRgb(int preset, int intensity, int &r, int &g, int &b);
 void markSupabaseFail();
 void markSupabaseOk();
 void updateSdAvailability(unsigned long now);
+
+static uint8_t bcd2bin(uint8_t v);
+static uint8_t bin2bcd(uint8_t v);
+static bool ds3231ReadTm(struct tm &out);
+static bool ds3231WriteFromSystemTime();
+static void initRtc();
+static void applyRtcToSystemTimeIfNeeded();
+static void maybeUpdateRtcFromSystemTime(unsigned long now);
+
+static String maskSecretForLog(const String &s);
+
+static bool tryInitSd(bool force);
+static const char* sdCardTypeStr(uint8_t t);
+void handleSdReinit();
+void handleSdInfo();
+
+void handleNoiseLedTest();
+static void tickNoiseLedTest(unsigned long now);
 
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
@@ -322,6 +353,10 @@ bool majorLogged = false;
 unsigned long lastLogTime = 0;
 LedState currentState = GREEN;
 
+bool noiseLedTestActive = false;
+LedState noiseLedTestState = GREEN;
+unsigned long noiseLedTestUntilMs = 0;
+
 unsigned long majorRepeatIntervalMs = 180000;
 unsigned long silenceResetWindowMs = 15000;
 
@@ -378,19 +413,42 @@ bool supabaseConfigured() {
 
 bool enqueuePendingEvent(const String &line) {
   File f = SD.open(PENDING_EVENTS_PATH, FILE_APPEND);
-  if (!f) return false;
+  if (!f) {
+    sdAvailable = false;
+    sdInitOk = false;
+    lastSdFailMs = millis();
+    return false;
+  }
   f.println(line);
   f.close();
   return true;
 }
 
 bool sdReady() {
+  return sdInitOk;
+}
+
+static const char* sdCardTypeStr(uint8_t t) {
+  switch (t) {
+    case CARD_NONE: return "NONE";
+    case CARD_MMC: return "MMC";
+    case CARD_SD: return "SD";
+    case CARD_SDHC: return "SDHC";
+    default: return "UNKNOWN";
+  }
+}
+
+static bool tryInitSd(bool force) {
   unsigned long now = millis();
-  if (sdInitOk) return true;
-  if ((lastSdBeginAttemptMs != 0) && (now - lastSdBeginAttemptMs < SYNC_RETRY_BACKOFF_MS)) return false;
+  const unsigned long COOLDOWN_MS = 30000;
+  if (!force && lastSdBeginAttemptMs != 0 && (now - lastSdBeginAttemptMs < COOLDOWN_MS)) return false;
   lastSdBeginAttemptMs = now;
-  if (!SD.begin(SD_CS, SPI, 1000000)) return false;
-  sdInitOk = (SD.cardType() != CARD_NONE);
+
+  bool ok = SD.begin(SD_CS, SPI, 1000000);
+  uint8_t ct = SD.cardType();
+  sdInitOk = ok && (ct != CARD_NONE);
+  sdAvailable = sdInitOk;
+  if (!sdInitOk) lastSdFailMs = now;
   return sdInitOk;
 }
 
@@ -403,7 +461,12 @@ uint64_t getEpochMs() {
 bool appendDbSeriesRecord(uint64_t tsMs, int db10) {
   if (!sdReady()) return false;
   File f = SD.open(DB_SERIES_PATH, FILE_APPEND);
-  if (!f) return false;
+  if (!f) {
+    sdAvailable = false;
+    sdInitOk = false;
+    lastSdFailMs = millis();
+    return false;
+  }
   f.print(String((unsigned long long)tsMs));
   f.print('|');
   f.println(db10);
@@ -446,7 +509,14 @@ bool tryBulkUploadDbSeries(unsigned long now) {
   bool didUploadAny = false;
 
   while (in.available()) {
+    {
+    unsigned long t0 = millis();
     server.handleClient();
+    unsigned long dt = millis() - t0;
+    if (dt > 1000) {
+      Serial.println(String("server.handleClient stall ms=") + dt);
+    }
+  }
     yield();
 
     if (millis() - startMs > maxWorkMs) {
@@ -1285,15 +1355,11 @@ void updateSdAvailability(unsigned long now) {
   const unsigned long SD_CHECK_MS = 30000;
   if (now - lastSdCheckMs < SD_CHECK_MS) return;
   lastSdCheckMs = now;
-  bool ok = sdReady();
-  bool prev = sdAvailable;
-  sdAvailable = ok;
-  if (!ok) {
-    lastSdFailMs = now;
-    sdInitOk = false;
-  }
+  static bool prev = true;
+  bool ok = sdAvailable;
   if (prev != ok) {
     appendEventLog(getTimeString() + String(ok ? " | SD card OK" : " | SD card NOT available"));
+    prev = ok;
   }
 }
 
@@ -1346,6 +1412,12 @@ void initLedPwm() {
 }
 
 void setNoiseLedPwm(LedState s) {
+  if (noiseLedTestActive) {
+    ledcWriteCompat(CH_NOISE_GREEN, (noiseLedTestState == GREEN) ? LEDC_MAX : 0);
+    ledcWriteCompat(CH_NOISE_YELLOW, (noiseLedTestState == YELLOW) ? LEDC_MAX : 0);
+    ledcWriteCompat(CH_NOISE_RED, (noiseLedTestState == RED) ? LEDC_MAX : 0);
+    return;
+  }
   if (!noiseLedsEnabled) {
     ledcWriteCompat(CH_NOISE_GREEN, 0);
     ledcWriteCompat(CH_NOISE_YELLOW, 0);
@@ -1358,6 +1430,12 @@ void setNoiseLedPwm(LedState s) {
   ledcWriteCompat(CH_NOISE_GREEN, g);
   ledcWriteCompat(CH_NOISE_YELLOW, y);
   ledcWriteCompat(CH_NOISE_RED, r);
+}
+
+static void setNoiseLedPwmForce(LedState s) {
+  ledcWriteCompat(CH_NOISE_GREEN, (s == GREEN) ? LEDC_MAX : 0);
+  ledcWriteCompat(CH_NOISE_YELLOW, (s == YELLOW) ? LEDC_MAX : 0);
+  ledcWriteCompat(CH_NOISE_RED, (s == RED) ? LEDC_MAX : 0);
 }
 
 void updateStatusLed(unsigned long now) {
@@ -1470,13 +1548,123 @@ void delayWithStatus(unsigned long ms) {
 }
 
 String getTimeString() {
+  time_t sec = time(NULL);
+  if (sec <= 1000) {
+    return "TIME_NOT_SET";
+  }
+
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
+  if (!getLocalTime(&timeinfo, 0)) {
     return "TIME_NOT_SET";
   }
   char buffer[25];
   strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
   return String(buffer);
+}
+
+static uint8_t bcd2bin(uint8_t v) {
+  return (uint8_t)(((v >> 4) * 10) + (v & 0x0F));
+}
+
+static uint8_t bin2bcd(uint8_t v) {
+  return (uint8_t)(((v / 10) << 4) | (v % 10));
+}
+
+static bool ds3231ReadTm(struct tm &out) {
+  Wire.beginTransmission(DS3231_I2C_ADDR);
+  Wire.write((uint8_t)0x00);
+  if (Wire.endTransmission(false) != 0) return false;
+  int n = Wire.requestFrom((int)DS3231_I2C_ADDR, 7);
+  if (n != 7) return false;
+
+  uint8_t sec = Wire.read();
+  uint8_t min = Wire.read();
+  uint8_t hour = Wire.read();
+  Wire.read();
+  uint8_t mday = Wire.read();
+  uint8_t mon = Wire.read();
+  uint8_t year = Wire.read();
+
+  out = {};
+  out.tm_sec = bcd2bin((uint8_t)(sec & 0x7F));
+  out.tm_min = bcd2bin((uint8_t)(min & 0x7F));
+
+  if (hour & 0x40) {
+    uint8_t hr12 = bcd2bin((uint8_t)(hour & 0x1F));
+    bool pm = (hour & 0x20) != 0;
+    if (hr12 == 12) hr12 = 0;
+    out.tm_hour = pm ? (hr12 + 12) : hr12;
+  } else {
+    out.tm_hour = bcd2bin((uint8_t)(hour & 0x3F));
+  }
+
+  out.tm_mday = bcd2bin((uint8_t)(mday & 0x3F));
+  out.tm_mon = (int)bcd2bin((uint8_t)(mon & 0x1F)) - 1;
+  out.tm_year = (int)bcd2bin(year) + 100;
+  return true;
+}
+
+static bool ds3231WriteFromSystemTime() {
+  time_t sec = time(NULL);
+  if (sec <= 1000) return false;
+
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;
+
+  Wire.beginTransmission(DS3231_I2C_ADDR);
+  Wire.write((uint8_t)0x00);
+  Wire.write(bin2bcd((uint8_t)t.tm_sec));
+  Wire.write(bin2bcd((uint8_t)t.tm_min));
+  Wire.write(bin2bcd((uint8_t)t.tm_hour));
+
+  int wday = t.tm_wday;
+  if (wday == 0) wday = 7;
+  Wire.write(bin2bcd((uint8_t)wday));
+
+  Wire.write(bin2bcd((uint8_t)t.tm_mday));
+  Wire.write(bin2bcd((uint8_t)(t.tm_mon + 1)));
+  Wire.write(bin2bcd((uint8_t)(t.tm_year - 100)));
+  return Wire.endTransmission() == 0;
+}
+
+static void initRtc() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setTimeOut(50);
+  Wire.beginTransmission(DS3231_I2C_ADDR);
+  rtcPresent = (Wire.endTransmission() == 0);
+}
+
+static void applyRtcToSystemTimeIfNeeded() {
+  if (!rtcPresent) return;
+  if (rtcTimeAppliedToSystem) return;
+  time_t nowSec = time(NULL);
+  if (nowSec > 1000) return;
+
+  struct tm rtc;
+  if (!ds3231ReadTm(rtc)) return;
+
+  time_t rtcEpoch = mktime(&rtc);
+  if (rtcEpoch <= 1000) return;
+
+  struct timeval tv;
+  tv.tv_sec = rtcEpoch;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  rtcTimeAppliedToSystem = true;
+}
+
+static void maybeUpdateRtcFromSystemTime(unsigned long now) {
+  if (!rtcPresent) return;
+  if (rtcUpdatedFromSystem) return;
+  time_t sec = time(NULL);
+  if (sec <= 1000) return;
+
+  if (lastRtcPollMs != 0 && (now - lastRtcPollMs < 15000)) return;
+  lastRtcPollMs = now;
+
+  if (ds3231WriteFromSystemTime()) {
+    rtcUpdatedFromSystem = true;
+  }
 }
 
 void setMP3Volume(uint8_t vol) {
@@ -1679,6 +1867,45 @@ void handleStatus() {
   out += "\"mp3tferr\":" + String((mp3Available && !mp3TfOnline) ? "true" : "false");
   out += "}";
   server.send(200, "application/json", out);
+}
+
+void handleNoiseLedTest() {
+  String c = server.hasArg("c") ? server.arg("c") : String("");
+  c.toLowerCase();
+
+  if (c == "off") {
+    noiseLedTestActive = false;
+    noiseLedTestUntilMs = 0;
+    setNoiseLedPwm(currentState);
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  LedState s = GREEN;
+  if (c == "green") s = GREEN;
+  else if (c == "yellow") s = YELLOW;
+  else if (c == "red") s = RED;
+  else {
+    server.send(400, "text/plain", "BAD_REQUEST");
+    return;
+  }
+
+  noiseLedTestActive = true;
+  noiseLedTestState = s;
+  noiseLedTestUntilMs = millis() + 3000;
+  setNoiseLedPwmForce(s);
+  server.send(200, "text/plain", "OK");
+}
+
+static void tickNoiseLedTest(unsigned long now) {
+  if (!noiseLedTestActive) return;
+  if (noiseLedTestUntilMs != 0 && now >= noiseLedTestUntilMs) {
+    noiseLedTestActive = false;
+    noiseLedTestUntilMs = 0;
+    setNoiseLedPwm(currentState);
+    return;
+  }
+  setNoiseLedPwmForce(noiseLedTestState);
 }
 
 void handleSetAlertConfig() {
@@ -2013,10 +2240,51 @@ void handleMonitor() {
   server.send(200, "text/plain", out);
 }
 
+static String maskSecretForLog(const String &s) {
+  if (s.length() == 0) return "(empty)";
+  if (s.length() == 1) return String("*");
+  if (s.length() == 2) return String("**");
+  String out;
+  out.reserve(24);
+  out += s[0];
+  out += "***";
+  out += s[s.length() - 1];
+  out += "(len=";
+  out += String(s.length());
+  out += ")";
+  return out;
+}
+
+void handleSdReinit() {
+  bool ok = tryInitSd(true);
+  server.send(200, "text/plain", ok ? "OK" : "FAIL");
+}
+
+void handleSdInfo() {
+  uint8_t ct = SD.cardType();
+  uint64_t sz = 0;
+  if (ct != CARD_NONE) sz = SD.cardSize();
+  String out;
+  out.reserve(220);
+  out += "{";
+  out += "\"sdInitOk\":" + String(sdInitOk ? "true" : "false") + ",";
+  out += "\"sdAvailable\":" + String(sdAvailable ? "true" : "false") + ",";
+  out += "\"cardType\":\"" + String(sdCardTypeStr(ct)) + "\",";  
+  out += "\"cardSizeMB\":" + String((unsigned long long)(sz / (1024ULL * 1024ULL)));
+  out += "}";
+  server.send(200, "application/json", out);
+}
+
 void handleNetworkConnection() {
   if (server.hasArg("ssid") && server.hasArg("password")) {
     networkSSID = server.arg("ssid");
     networkPassword = server.arg("password");
+    networkSSID.trim();
+    networkPassword.trim();
+
+    if (serialLoggingEnabled) {
+      Serial.println(String("WiFi save SSID=") + networkSSID + " PW=" + maskSecretForLog(networkPassword));
+    }
 
     preferences.begin("wifi", false);
     preferences.putString("ssid", networkSSID);
@@ -2043,6 +2311,13 @@ void connectToWiFi() {
   networkSSID = preferences.getString("ssid", "");
   networkPassword = preferences.getString("password", "");
   preferences.end();
+
+  networkSSID.trim();
+  networkPassword.trim();
+
+  if (serialLoggingEnabled) {
+    Serial.println(String("WiFi creds (stored) SSID=") + networkSSID + " PW=" + maskSecretForLog(networkPassword));
+  }
 
   if (networkSSID.length() == 0) {
     wifiConnecting = false;
@@ -2186,16 +2461,23 @@ void setup() {
   pinMode(STATUS_LED_B, OUTPUT);
 
   SPI.begin(18, 19, 23, SD_CS);
-  SD.begin(SD_CS, SPI, 1000000);
+  {
+    bool ok = SD.begin(SD_CS, SPI, 1000000);
+    sdInitOk = ok && (SD.cardType() != CARD_NONE);
+    sdAvailable = sdInitOk;
+  }
 
   loadDeviceSettings();
 
   initLedPwm();
+
+  initRtc();
+  applyRtcToSystemTimeIfNeeded();
   
   WiFi.mode(WIFI_AP_STA);
   WiFi.onEvent(onWiFiEvent);
   WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
+  WiFi.setAutoReconnect(false);
   WiFi.persistent(false);
   WiFi.softAP("ESP32_NOISE_Setup", "12345678");
   logNetworkInfo("Boot");
@@ -2225,6 +2507,9 @@ void setup() {
   server.on("/statusLedManual", handleStatusLedManual);
   server.on("/events", handleEvents);
   server.on("/monitor", handleMonitor);
+  server.on("/sdreinit", handleSdReinit);
+  server.on("/sdinfo", handleSdInfo);
+  server.on("/testNoiseLed", handleNoiseLedTest);
   server.begin();
 
   // ===== TIME SYNC =====
@@ -2293,6 +2578,10 @@ void loop() {
     mp3ConsecutiveFailCount = 0;
   }
 
+  tickNoiseLedTest(now);
+
+  maybeUpdateRtcFromSystemTime(now);
+
   if (now - lastMp3ProbeMs >= 5000) {
     lastMp3ProbeMs = now;
     probeMp3();
@@ -2320,7 +2609,29 @@ void loop() {
     logNetworkInfo("AP turned off");
   }
 
-  updateStatusLed(now);
+  {
+    unsigned long t0 = millis();
+    updateStatusLed(now);
+    unsigned long dt = millis() - t0;
+    if (dt > 1000) {
+      Serial.println(String("updateStatusLed stall ms=") + dt);
+    }
+  }
+
+  // Single-attempt reconnect policy: after a failure, suppress further WiFi.begin() calls for a cooldown.
+  if (staSuppressed) {
+    if (now >= staSuppressedUntilMs) {
+      staSuppressed = false;
+      nextWifiRetryAllowedMs = 0;
+    } else {
+      if (wifiConnecting) {
+        wifiConnecting = false;
+        WiFi.disconnect(false, false);
+      }
+      delay(50);
+      return;
+    }
+  }
 
   if (staNowConnected && (now - lastInternetCheckMs >= INTERNET_CHECK_INTERVAL_MS)) {
     unsigned long t0 = millis();
@@ -2364,18 +2675,15 @@ void loop() {
       // Keep SoftAP stable; avoid restarting AP here.
       if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
       logNetworkInfo("WiFi connect failed");
-    }
-  }
 
-  if (!wifiConnected && !wifiConnecting && (networkSSID.length() > 0) && (now - lastWifiRetryMs >= WIFI_RETRY_INTERVAL_MS)) {
-    lastWifiRetryMs = now;
-    Serial.println(String("WiFi begin (retry) SSID=") + networkSSID);
-    WiFi.begin(networkSSID.c_str(), networkPassword.c_str());
-    wifiConnecting = true;
-    wifiStartTime = millis();
-    wifiStatusMessage = "Reconnecting...";
-    appendEventLog(getTimeString() + " | WiFi reconnect attempt");
-    logNetworkInfo("WiFi reconnect attempt");
+      // Enter cooldown immediately after the first failed attempt to avoid repeated stalls.
+      staSuppressed = true;
+      staSuppressedUntilMs = now + 60000;
+      nextWifiRetryAllowedMs = staSuppressedUntilMs;
+      // Do not fall through into retry logic in the same loop iteration.
+      delay(50);
+      return;
+    }
   }
 
   if (now - lastSupabaseSyncTime >= SUPABASE_SYNC_INTERVAL_MS) {
@@ -2427,7 +2735,14 @@ void loop() {
     return;
   }
 
-  rawDB = readMicDB();
+  {
+    unsigned long t0 = millis();
+    rawDB = readMicDB();
+    unsigned long dt = millis() - t0;
+    if (dt > 1000) {
+      Serial.println(String("readMicDB stall ms=") + dt);
+    }
+  }
   smoothDB = smoothDB + SMOOTH_ALPHA * (rawDB - smoothDB);
   int avgDB = getMovingAverage((int)smoothDB);
 
@@ -2459,7 +2774,13 @@ void loop() {
     if (changed || heartbeatDue) {
       uint64_t tsMs = getEpochMs();
       if (tsMs != 0) {
-        if (appendDbSeriesRecord(tsMs, db10)) {
+        unsigned long t0 = millis();
+        bool ok = appendDbSeriesRecord(tsMs, db10);
+        unsigned long dt = millis() - t0;
+        if (dt > 1000) {
+          Serial.println(String("appendDbSeriesRecord stall ms=") + dt);
+        }
+        if (ok) {
           lastDbLogged10 = db10;
           lastDbRecordMs = now;
         } else {
@@ -2497,7 +2818,14 @@ void loop() {
   if ((now - lastLogTime >= LOG_INTERVAL_MS) &&
       abs((int)smoothDB - lastLoggedDB) >= DB_CHANGE_LOG) {
 
-    logNoise((int)smoothDB);
+    {
+      unsigned long t0 = millis();
+      logNoise((int)smoothDB);
+      unsigned long dt = millis() - t0;
+      if (dt > 1000) {
+        Serial.println(String("logNoise stall ms=") + dt);
+      }
+    }
     lastLoggedDB = (int)smoothDB;
     lastLogTime = now;
   }
