@@ -12,6 +12,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <esp_wifi_types.h>
+#include <esp_sntp.h>
 #include "web_ui.h"
 
 // ================= LED PWM =================
@@ -52,6 +53,8 @@ static inline void ledcAttachCompat(uint8_t pin, uint8_t channel) {
 #endif
 }
 
+static void onNtpTimeSync(struct timeval *tv);
+
 static inline void ledcWriteCompat(uint8_t channel, uint32_t duty) {
 #if ESP32_ARDUINO_LEDC_BY_PIN
   int pin = ledcChannelPinMap[channel];
@@ -73,6 +76,24 @@ bool rtcPresent = false;
 bool rtcTimeAppliedToSystem = false;
 bool rtcUpdatedFromSystem = false;
 unsigned long lastRtcPollMs = 0;
+
+static volatile bool ntpTimeSynced = false;
+static volatile bool tzReapplyRequested = false;
+
+static void onNtpTimeSync(struct timeval *tv);
+
+static void applyTimezone();
+
+static void onNtpTimeSync(struct timeval *tv) {
+  (void)tv;
+  ntpTimeSynced = true;
+  tzReapplyRequested = true;
+}
+
+static void applyTimezone() {
+  setenv("TZ", "PHT-8", 1);
+  tzset();
+}
 
 String networkSSID = "";
 String networkPassword = "";
@@ -139,6 +160,8 @@ static void initRtc();
 static void applyRtcToSystemTimeIfNeeded();
 static void maybeUpdateRtcFromSystemTime(unsigned long now);
 
+static time_t timegmPortable(struct tm *t);
+
 static String maskSecretForLog(const String &s);
 
 static bool tryInitSd(bool force);
@@ -148,6 +171,9 @@ void handleSdInfo();
 
 void handleNoiseLedTest();
 static void tickNoiseLedTest(unsigned long now);
+
+void handleRtcInfo();
+void handleRtcSync();
 
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
@@ -1609,7 +1635,7 @@ static bool ds3231WriteFromSystemTime() {
   if (sec <= 1000) return false;
 
   struct tm t;
-  if (!getLocalTime(&t, 0)) return false;
+  if (!gmtime_r(&sec, &t)) return false;
 
   Wire.beginTransmission(DS3231_I2C_ADDR);
   Wire.write((uint8_t)0x00);
@@ -1625,6 +1651,42 @@ static bool ds3231WriteFromSystemTime() {
   Wire.write(bin2bcd((uint8_t)(t.tm_mon + 1)));
   Wire.write(bin2bcd((uint8_t)(t.tm_year - 100)));
   return Wire.endTransmission() == 0;
+}
+
+static time_t timegmPortable(struct tm *t) {
+  if (!t) return (time_t)-1;
+  // Convert a UTC broken-down time to epoch seconds without relying on TZ.
+  // DS3231 data is treated as UTC.
+  int year = t->tm_year + 1900;
+  int mon = t->tm_mon + 1; // 1-12
+  int mday = t->tm_mday;
+  int hour = t->tm_hour;
+  int min = t->tm_min;
+  int sec = t->tm_sec;
+
+  if (year < 1970 || mon < 1 || mon > 12 || mday < 1 || mday > 31) return (time_t)-1;
+
+  auto isLeap = [](int y) -> bool {
+    return ((y % 4) == 0 && (y % 100) != 0) || ((y % 400) == 0);
+  };
+
+  static const int daysBeforeMonthNorm[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+  static const int daysBeforeMonthLeap[12] = {0,31,60,91,121,152,182,213,244,274,305,335};
+  const int* daysBefore = isLeap(year) ? daysBeforeMonthLeap : daysBeforeMonthNorm;
+
+  // Days from 1970-01-01 to year-01-01
+  long days = 0;
+  for (int y = 1970; y < year; y++) {
+    days += isLeap(y) ? 366 : 365;
+  }
+
+  // Add days in months before current month
+  days += daysBefore[mon - 1];
+  // Add days in current month (mday is 1-based)
+  days += (mday - 1);
+
+  long out = days * 86400L + hour * 3600L + min * 60L + sec;
+  return (time_t)out;
 }
 
 static void initRtc() {
@@ -1643,7 +1705,7 @@ static void applyRtcToSystemTimeIfNeeded() {
   struct tm rtc;
   if (!ds3231ReadTm(rtc)) return;
 
-  time_t rtcEpoch = mktime(&rtc);
+  time_t rtcEpoch = timegmPortable(&rtc);
   if (rtcEpoch <= 1000) return;
 
   struct timeval tv;
@@ -1656,15 +1718,118 @@ static void applyRtcToSystemTimeIfNeeded() {
 static void maybeUpdateRtcFromSystemTime(unsigned long now) {
   if (!rtcPresent) return;
   if (rtcUpdatedFromSystem) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!internetOk) return;
+  if (!ntpTimeSynced) return;
   time_t sec = time(NULL);
   if (sec <= 1000) return;
 
   if (lastRtcPollMs != 0 && (now - lastRtcPollMs < 15000)) return;
   lastRtcPollMs = now;
 
-  if (ds3231WriteFromSystemTime()) {
+  struct tm rtc;
+  if (!ds3231ReadTm(rtc)) return;
+  time_t rtcEpoch = timegmPortable(&rtc);
+
+  time_t sysEpoch = time(NULL);
+  long delta = (long)(sysEpoch - rtcEpoch);
+  if (delta < 0) delta = -delta;
+  if (delta <= 120) {
+    rtcUpdatedFromSystem = true;
+    return;
+  }
+
+  if (!ds3231WriteFromSystemTime()) return;
+
+  // Read-back verify so we don't get stuck thinking we updated when the write didn't take.
+  struct tm rtc2;
+  if (!ds3231ReadTm(rtc2)) return;
+  time_t rtcEpoch2 = timegmPortable(&rtc2);
+  if (rtcEpoch2 <= 1000) return;
+  long delta2 = (long)(sysEpoch - rtcEpoch2);
+  if (delta2 < 0) delta2 = -delta2;
+  if (delta2 <= 120) {
     rtcUpdatedFromSystem = true;
   }
+}
+
+void handleRtcInfo() {
+  struct tm rtc;
+  bool rtcReadOk = false;
+  if (rtcPresent) {
+    rtcReadOk = ds3231ReadTm(rtc);
+  }
+
+  time_t sysSec = time(NULL);
+  bool sysTimeSet = (sysSec > 1000);
+
+  String rtcUtcStr = "";
+  String rtcLocalStr = "";
+  if (rtcReadOk) {
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &rtc);
+    rtcUtcStr = String(buf);
+
+    time_t re = timegmPortable(&rtc);
+    if (re > 1000) {
+      struct tm lt;
+      if (localtime_r(&re, &lt)) {
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &lt);
+        rtcLocalStr = String(buf);
+      }
+    }
+  }
+
+  String sysStr = "";
+  if (sysTimeSet) {
+    struct tm t;
+    if (getLocalTime(&t, 0)) {
+      char buf[32];
+      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+      sysStr = String(buf);
+    }
+  }
+
+  String out;
+  out.reserve(260);
+  const char* tz = getenv("TZ");
+  out += "{";
+  out += "\"rtcPresent\":" + String(rtcPresent ? "true" : "false") + ",";
+  out += "\"rtcReadOk\":" + String(rtcReadOk ? "true" : "false") + ",";
+  out += "\"rtcUtc\":\"" + jsonEscape(rtcUtcStr) + "\",";
+  out += "\"rtcLocal\":\"" + jsonEscape(rtcLocalStr) + "\",";
+  out += "\"sysTimeSet\":" + String(sysTimeSet ? "true" : "false") + ",";
+  out += "\"sysTime\":\"" + jsonEscape(sysStr) + "\",";
+  out += "\"ntpSynced\":" + String(ntpTimeSynced ? "true" : "false") + ",";
+  out += "\"tz\":\"" + jsonEscape(tz ? String(tz) : String("")) + "\",";
+  out += "\"rtcAppliedToSystem\":" + String(rtcTimeAppliedToSystem ? "true" : "false") + ",";
+  out += "\"rtcUpdatedFromSystem\":" + String(rtcUpdatedFromSystem ? "true" : "false") + ",";
+  out += "\"i2cSda\":" + String(I2C_SDA_PIN) + ",";
+  out += "\"i2cScl\":" + String(I2C_SCL_PIN);
+  out += "}";
+
+  server.send(200, "application/json", out);
+}
+
+void handleRtcSync() {
+  time_t sysSec = time(NULL);
+  bool sysTimeSet = (sysSec > 1000);
+
+  bool ok = false;
+  if (rtcPresent && sysTimeSet && ntpTimeSynced) {
+    ok = ds3231WriteFromSystemTime();
+    if (ok) rtcUpdatedFromSystem = true;
+  }
+
+  String out;
+  out.reserve(120);
+  out += "{";
+  out += "\"ok\":" + String(ok ? "true" : "false") + ",";
+  out += "\"rtcPresent\":" + String(rtcPresent ? "true" : "false") + ",";
+  out += "\"sysTimeSet\":" + String(sysTimeSet ? "true" : "false") + ",";
+  out += "\"ntpSynced\":" + String(ntpTimeSynced ? "true" : "false");
+  out += "}";
+  server.send(ok ? 200 : 409, "application/json", out);
 }
 
 void setMP3Volume(uint8_t vol) {
@@ -2452,6 +2617,8 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  applyTimezone();
+
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_YELLOW, OUTPUT);
   pinMode(LED_RED, OUTPUT);
@@ -2510,11 +2677,14 @@ void setup() {
   server.on("/sdreinit", handleSdReinit);
   server.on("/sdinfo", handleSdInfo);
   server.on("/testNoiseLed", handleNoiseLedTest);
+  server.on("/rtcinfo", handleRtcInfo);
+  server.on("/rtcsync", handleRtcSync);
   server.begin();
 
   // ===== TIME SYNC =====
-  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, "pool.ntp.org", "time.nist.gov");
-  Serial.println("Time synchronized");
+  sntp_set_time_sync_notification_cb(onNtpTimeSync);
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.println("Time sync started");
 
   // ===== MP3 INIT (BOOT WAIT) =====  
   delayWithStatus(8000);                              // MP3 boot time
@@ -2556,8 +2726,27 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  if (tzReapplyRequested) {
+    tzReapplyRequested = false;
+    applyTimezone();
+  }
+
+  static bool timeSyncLogged = false;
+  if (!timeSyncLogged) {
+    if (ntpTimeSynced) {
+      timeSyncLogged = true;
+      Serial.println("Time synchronized");
+    }
+  }
+
   const bool staNowConnected = (WiFi.status() == WL_CONNECTED);
   wifiConnected = staNowConnected;
+
+  static bool lastStaConnected = false;
+  if (staNowConnected && !lastStaConnected) {
+    applyTimezone();
+  }
+  lastStaConnected = staNowConnected;
 
   static unsigned long lastLoopMs = 0;
   static unsigned long lastLoopStallLogMs = 0;
