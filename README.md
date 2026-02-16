@@ -1,484 +1,350 @@
-# ESP32 Noise Monitor (releasev1)
-
-ESP32-based classroom noise monitoring firmware with:
-
-- Traffic-light noise LEDs (Green/Yellow/Red) with brightness control
-- Status RGB LED for network/system state
-- INMP441 I2S microphone dB estimation with smoothing + moving average
-- Configurable multi-stage RED escalation (FIRST → SECOND → MAJOR)
-- Continuous-noise MAJOR repeat alerts while noise stays above RED
-- Silence window reset logic (requires quiet time below RED before resetting escalation)
-- Optional MP3 warning playback (UART MP3 module)
-- Optional short WAV recordings on MAJOR events (SD card)
-- Offline-safe event queue on SD and sync to Supabase when online
-- Bulk upload for pending (non-audio) events to reduce HTTP overhead
-- Built-in admin web UI served from ESP32 (`/`) to configure device
-
-This folder is an **Arduino sketch**:
-
-- `releasev1.ino` — main firmware
-- `web_ui.h` — single-page admin UI served by the ESP32
-- `types.h` — shared types (`LedState`)
-
----
-
-## Hardware
-
-### Required
-
-- **ESP32** (Arduino-ESP32 core)
-- **INMP441** digital microphone (I2S)
-- **Traffic-light LEDs** (3x discrete LED)
-- **SD card module** (SPI)
-
-### Optional
-
-- **UART MP3 player module** (DFPlayer-style) + speaker
-- **Status RGB LED** (common cathode)
-
-### Pin mapping (from `releasev1.ino`)
-
-Noise LEDs:
-
-- `LED_GREEN` = GPIO **14**
-- `LED_YELLOW` = GPIO **12**
-- `LED_RED` = GPIO **27**
-
-Status RGB (common cathode):
-
-- `STATUS_LED_R` = GPIO **21**
-- `STATUS_LED_G` = GPIO **22**
-- `STATUS_LED_B` = GPIO **13**
-
-SD card:
-
-- `SD_CS` = GPIO **5**
-- SPI bus initialized as `SPI.begin(18, 19, 23, SD_CS)`
-
-INMP441 I2S:
-
-- `I2S_WS` = GPIO **25**
-- `I2S_SD` = GPIO **33**
-- `I2S_SCK` = GPIO **26**
-
-MP3 UART (HardwareSerial2):
-
-- RX = GPIO **16**
-- TX = GPIO **17**
-
----
-
-## Firmware overview
-
-### Main loop responsibilities
-
-`loop()` continuously:
-
-- Handles HTTP requests (`server.handleClient()`)
-- Maintains MP3 availability probing
-- Maintains Wi-Fi connection and retry behavior
-- Checks internet reachability periodically
-- Syncs queued events to Supabase periodically (and also on-demand after queueing)
-- Reads microphone samples via I2S and computes smoothed dB
-- Updates noise LEDs (`updateLEDState()`)
-- Runs RED escalation state machine (`handleRedWarnings()`)
-- Logs a dB time-series to SD (change-based + heartbeat) and bulk uploads it
-
----
-
-## Noise measurement pipeline
-
-### `readMicDB()`
-
-- Reads `samples[]` via `i2s_read()`
-- Computes RMS of the samples
-- Subtracts `NOISE_FLOOR`
-- Converts to a rough dB-like metric using:
-
-```text
-20 * log10(rms + 1) * SENSITIVITY
-```
-
-Key constants:
-
-- `NOISE_FLOOR = 25000`
-- `SENSITIVITY = 0.5`
-
-### Smoothing + average
-
-- Exponential smoothing:
-
-```cpp
-smoothDB = smoothDB + SMOOTH_ALPHA * (rawDB - smoothDB);
-```
-
-- Moving average window (`AVG_WINDOW = 10`) via `getMovingAverage()`
-
-Note: LEDs and warnings use `smoothDB` (cast to `int`).
-
----
-
-## LED behavior
-
-### Noise LEDs (`updateLEDState()`)
-
-- Switches to **RED immediately** when `value >= RED_THRESHOLD`
-- Switches to **YELLOW immediately** when `value >= YELLOW_THRESHOLD`
-- Uses hysteresis only on the **falling edge** to reduce flicker:
-
-- RED → YELLOW only if `value < RED_THRESHOLD - HYSTERESIS_DB`
-- YELLOW → GREEN only if `value < YELLOW_THRESHOLD - HYSTERESIS_DB`
-
-`HYSTERESIS_DB = 3`.
-
-### Status RGB LED (`updateStatusLed()`)
-
-Shows a color (and sometimes blinking) based on:
-
-- Booting vs setup-complete
-- AP/STA mode and connection
-- Internet OK vs no internet
-- Any error state:
-  - SD not available
-  - MIC stuck at 0
-  - Supabase request failures
-  - MP3 not detected
-
-Admin can configure:
-
-- “preset” colors (`/setStatusColors`) and exact RGB values (`/setStatusRgb`)
-- manual override (`/statusLedManual`)
-
----
-
-## RED escalation + continuous noise logic
-
-All RED escalation happens in `handleRedWarnings(value, now)`.
-
-### Violation start / grouping
-
-When `value >= RED_THRESHOLD` and `redStartTime == 0`, a new violation starts:
-
-- `redStartTime = now`
-- flags reset (`firstLogged/secondLogged/majorLogged = false`)
-- `currentViolationGroupId = genUuidV4()`
-
-All events during that violation share the same `event_group_id`.
-
-### Configurable warning timings
-
-Three escalation steps are configurable (via web UI + Preferences):
-
-- `firstWarningTimeMs`
-- `secondWarningTimeMs`
-- `majorWarningTimeMs`
-
-Defaults (compile-time):
-
-- FIRST: 5s (`FIRST_WARNING_TIME`)
-- SECOND: 30s (`SECOND_WARNING_TIME`)
-- MAJOR: 60s (`MAJOR_WARNING_TIME`)
-
-Ordering is enforced:
-
-- `first < second < major`
-
-### Continuous MAJOR repeat
-
-If MAJOR already triggered and noise stays above RED, the device repeats MAJOR:
-
-- Every `majorRepeatIntervalMs`
-- Logs a repeat
-- Records audio again (WAV)
-- Queues a new MAJOR event
-
-### Silence reset window
-
-If `value < RED_THRESHOLD`, escalation does **not** reset immediately.
-
-It resets only if noise stays below RED continuously for:
-
-- `silenceResetWindowMs`
-
-After reset:
-
-- next time it goes RED again, it starts from FIRST.
-
----
-
-## SD card files + formats
-
-### 1) Pending events queue
-
-Path:
-
-- `/pending_events.txt`
-
-Purpose:
-
-- Offline-safe queue of warning events to be uploaded to Supabase.
-
-Current line format (newest):
-
-```text
-eventId|groupId|warningLevel|durationSeconds|decibel|buzzerTriggered|audioRecorded|audioLocalPath|eventTsMs
-```
-
-Examples:
-
-- `warningLevel` is one of: `FIRST`, `SECOND`, `MAJOR`
-- `durationSeconds` is:
-  - configured seconds for FIRST/SECOND/MAJOR
-  - elapsed seconds since violation start for MAJOR repeats
-- `buzzerTriggered` is `1` if speaker was enabled at the time
-- `audioRecorded` is `1` if a WAV was recorded
-- `audioLocalPath` is a filename like `/rec_YYYYMMDD_HHMMSS.wav` (or empty)
-- `eventTsMs` is epoch milliseconds (`getEpochMs()`), stored as an integer
-
-Backward compatibility:
-
-- Old formats without `groupId` and/or `eventTsMs` are still parsed and uploaded.
-
-### 2) dB time-series log
-
-Path:
-
-- `/db_series.txt`
-
-Format:
-
-```text
-ts_ms|db10
-```
-
-Where:
-
-- `ts_ms` = epoch milliseconds
-- `db10` = dB * 10 (integer)
-
-Upload:
-
-- batched to Supabase table `noise_db_series` as a JSON array.
-
-### 3) Rolling noise log
-
-Path:
-
-- `/noise_log.txt`
-
-Used for debug logging and event lines.
-
----
-
-## Supabase integration
-
-### Supabase settings
-
-In `releasev1.ino`:
-
-- `SUPABASE_URL`
-- `SUPABASE_API_KEY`
-
-These are compiled into the firmware.
-
-### Tables / storage expected
-
-1) `noise_events` (PostgREST endpoint: `/rest/v1/noise_events`)
-
-Firmware inserts JSON with at least:
-
-- `id` (uuid string)
-- `device_id` (string)
-- `event_group_id` (uuid string)
-- `warning_level` (string)
-- `warning_color` (`RED`)
-- `duration_seconds` (int)
-- `decibel` (int)
-- `buzzer_triggered` (bool)
-- `audio_recorded` (bool)
-- optional: `audio_url` (string)
-- optional: `event_ts_ms` (bigint) — **actual occurrence time** (important for offline sync)
-
-2) Storage bucket: `recordings`
-
-- WAVs are uploaded to:
-
-```text
-/storage/v1/object/recordings/<DEVICE_ID>/<eventId>.wav
-```
-
-- Public URL format:
-
-```text
-/storage/v1/object/public/recordings/<DEVICE_ID>/<eventId>.wav
-```
-
-3) `noise_event_audio`
-
-Inserted when audio exists:
-
-- `noise_event_id`
-- `audio_url`
-- `audio_seconds` (currently fixed to 5)
-
-4) `noise_db_series`
-
-Bulk inserts `{ device_id, ts_ms, db10 }`.
-
-### Bulk upload behavior (pending events)
-
-`trySyncPendingEvents()`:
-
-- Batches up to 10 **non-audio** pending events into a single POST (JSON array)
-- Uploads **audio events** individually (because it must upload the WAV first)
-- Processes up to 12 events per run and uses a time budget to avoid blocking too long
-
----
-
-## Web UI
-
-The ESP32 serves a single-page admin interface from PROGMEM:
-
-- `GET /` → HTML/JS from `web_ui.h`
-
-The UI:
-
-- Performs Supabase login (email/password) client-side
-- Checks the user’s role via `profiles` table (`role === 'admin'`)
-- If admin, enables the controls panel
-
-### Key endpoints used by the UI
-
-- `GET /status` → JSON status/config snapshot
-- `GET /scan` → Wi-Fi scan results
-- `GET /save?ssid=...&password=...` → save Wi-Fi credentials
-- `GET /disconnect` → clear Wi-Fi and re-enable setup AP
-
-Admin controls:
-
-- `GET /setThresholds?yellow=..&red=..`
-- `GET /setAlertConfig?maj_min=..&sil_sec=..&first_sec=..&second_sec=..&major_sec=..`
-- `GET /setSpeaker?enabled=0|1`
-- `GET /setMp3Volume?vol=0..30`
-- `GET /setLedBrightness?ng=..&ny=..&nr=..&st=..`
-- `GET /setNoiseLedsEnabled?enabled=0|1`
-- `GET /setMicEnabled?enabled=0|1`
-- `GET /setSerialLogging?enabled=0|1`
-- `GET /setStatusColors?boot=..&ap=..&wifi=..&noi=..&off=..`
-- `GET /setStatusRgb?boot=#RRGGBB&ap=#RRGGBB&wifi=#RRGGBB&noi=#RRGGBB&off=#RRGGBB`
-- `GET /setDbLogConfig?samp=..&thr10=..&hb=..&up=..`
-- `GET /statusLedManual?on=0|1&r=..&g=..&b=..`
-- `GET /events` → device event logs
-- `GET /monitor` → dB/LED monitor logs
-
----
-
-## Configuration storage
-
-Settings are persisted in ESP32 NVS using `Preferences`:
-
-Namespace `settings`:
-
-- Thresholds: `yellow`, `red`
-- Alert timers: `fw_ms`, `sw_ms`, `mw_ms`, `maj_int`, `sil_win`
-- LED brightness: `ngbrt`, `nybrt`, `nrbrt`, `stbrt`
-- Toggles: `nleden`, `micen`, `serlog`, `speaker`
-- MP3 volume: `mp3vol`
-- Status colors: `sr_boot`, `sr_ap`, `sr_wifi`, `sr_noi`, `sr_off`
-- DB series logging: `db_samp`, `db_thr10`, `db_hb`, `db_up`
-
-Namespace `wifi`:
-
-- `ssid`, `password`
-
----
-
-## Build & flash
-
-### Requirements
-
-- Arduino IDE or PlatformIO
-- ESP32 board package (Arduino-ESP32)
-- Libraries used are standard in Arduino-ESP32:
-  - `WiFi`, `WebServer`, `HTTPClient`, `WiFiClientSecure`, `Preferences`, `SPI`, `SD`
-
-### Steps (Arduino IDE)
-
-1. Open `releasev1.ino`
-2. Select your ESP32 board + correct COM port
-3. Compile and Upload
-4. Open Serial Monitor at **115200**
-
----
-
-## First-time setup / provisioning
-
-1. Power on the ESP32
-2. Connect to the setup AP:
-
+# IoT-Based Smart Classroom Noise Monitoring Using Traffic Light Indicator System (ESP32)
+
+## Abstract
+This project implements an **IoT-based classroom noise monitoring system** using an **ESP32** and an **INMP441 digital microphone** (I2S). The device continuously samples audio, computes an estimated sound level (dB), and provides immediate visual feedback using a **traffic-light LED indicator (Green/Yellow/Red)**. When excessive noise persists, the system escalates alerts using a **speaker/MP3 warning module** and (for major violations) captures a short **5‑second audio clip** as evidence. Events are stored locally on an **SD card** and synchronized to a **Supabase (PostgreSQL + Storage)** backend when internet connectivity is available.
+
+The firmware includes a built-in **web-based admin interface** hosted directly on the ESP32 for Wi‑Fi provisioning, live monitoring, device settings, and diagnostics.
+
+## Project Objectives
+- Monitor classroom noise levels in near real-time.
+- Provide clear visual feedback through a traffic-light indicator.
+- Reduce false positives using smoothing, hysteresis, and time-based escalation.
+- Log noise incidents with timestamps and severity levels.
+- Support offline-first operation with SD buffering and later cloud synchronization.
+- Enforce privacy by recording **only event-triggered short clips** (no continuous recording / no live listening).
+
+## Scope and Limitations
+- **Noise level** is computed from microphone RMS and is an **estimated dB-like value**. It is not a calibrated Class‑1/2 SPL meter unless you perform calibration.
+- Audio recording is **triggered only for MAJOR events** and records **exactly 5 seconds**.
+- The firmware syncs directly to Supabase using REST endpoints and uploads audio to a Supabase Storage bucket.
+- Role-based admin access is handled via Supabase Auth + a `profiles` table (see backend requirements).
+
+## Key Features
+- **Traffic light indicator**
+  - Green: normal
+  - Yellow: moderate noise
+  - Red: excessive noise
+- **Escalation logic while Red persists**
+  - First warning at configurable time
+  - Second warning at configurable time
+  - Major warning at configurable time (records 5s audio)
+  - Major repeat warning at configurable interval
+- **Offline-first**
+  - Events are queued to SD (`/pending_events.txt`) and uploaded later.
+  - Time-series dB values are stored to SD (`/db_series.txt`) and bulk uploaded.
+- **Web-based admin UI hosted on ESP32**
+  - Wi‑Fi scanning and configuration
+  - Thresholds and timers configuration
+  - LED brightness controls
+  - Speaker/MP3 test controls + volume
+  - Live monitor and logs
+  - SD and RTC diagnostics
+
+## Repository Contents
+- `releasev1.ino`
+  - Main ESP32 firmware
+- `web_ui.h`
+  - Embedded single-page admin UI served at `/`
+- `types.h`
+  - Shared enums/types
+- `plan.txt`
+  - System design notes and capstone planning
+
+## System Architecture
+### Layer 1 — Edge / Classroom Device (ESP32)
+Responsibilities:
+- Sample audio via INMP441 (I2S)
+- Compute smoothed dB estimate
+- Apply thresholds + hysteresis
+- Drive traffic-light LEDs
+- Escalate alerts via MP3 module
+- Record short 5s WAV for major events
+- Store logs and pending events on SD
+- Sync events and audio to Supabase
+
+### Layer 2 — Backend / Cloud (Supabase)
+Responsibilities:
+- Store event metadata and time-series records
+- Store event-triggered audio clips (Supabase Storage)
+- Provide authentication (Supabase Auth)
+- Provide role-based access via `profiles` table
+
+### Layer 3 — Web Application / Dashboard
+This repository contains the **device-side admin UI** hosted on the ESP32.
+A separate teacher/admin dashboard can be built on top of the Supabase database.
+
+## Hardware Requirements (Bill of Materials)
+- ESP32 development board
+- INMP441 digital microphone module (I2S)
+- 3 LEDs (Green/Yellow/Red) + resistors
+- Status RGB LED (common cathode) + resistors
+- MicroSD card module + microSD card
+- MP3 module (DFPlayer Mini or compatible UART MP3 module) + speaker
+- (Optional) DS3231 RTC module
+- Wires, breadboard/PCB, power supply
+
+## Wiring / Pin Map (as configured in firmware)
+### Traffic-light LEDs
+- Green LED: GPIO `14`
+- Yellow LED: GPIO `12`
+- Red LED: GPIO `27`
+
+### Status RGB LED (Common Cathode)
+- R: GPIO `21`
+- G: GPIO `22`
+- B: GPIO `13`
+
+### SD Card (SPI)
+- CS: GPIO `5`
+- SPI bus initialized as:
+  - SCK `18`
+  - MISO `19`
+  - MOSI `23`
+
+### INMP441 (I2S)
+- WS/LRCL: GPIO `25`
+- SD/DOUT: GPIO `33`
+- SCK/BCLK: GPIO `26`
+
+### MP3 Module (UART2)
+- ESP32 RX2: GPIO `16`  (connect to MP3 TX)
+- ESP32 TX2: GPIO `17`  (connect to MP3 RX)
+
+### DS3231 RTC (Optional, I2C)
+- SDA: GPIO `32`
+- SCL: GPIO `4`
+- I2C address: `0x68`
+
+## Firmware Behavior
+### Noise thresholds
+Default thresholds in code (can be changed in UI and saved to NVS):
+- `YELLOW_THRESHOLD`: `65`
+- `RED_THRESHOLD`: `70`
+
+### Smoothing and stability controls
+- Exponential smoothing factor: `SMOOTH_ALPHA = 0.1`
+- Hysteresis: `HYSTERESIS_DB = 3`
+- Moving average window: `AVG_WINDOW = 10`
+
+### Escalation timers (defaults)
+- First warning time: `5s`
+- Second warning time: `30s`
+- Major warning time: `60s`
+- Major repeat interval: `180000ms` (3 minutes)
+- Silence reset window: `15000ms` (15 seconds below red threshold before resetting the “red session”)
+
+### What gets recorded and uploaded
+- **Events**: saved to SD and synced to Supabase.
+- **Audio**: only for **MAJOR** events (and repeat majors), records **5 seconds** to SD, then uploads to Supabase Storage.
+- **dB time series**: stored as `db10` (dB * 10) and uploaded in batches.
+
+## Device Web UI (ESP32 hosted)
+### Access
+On boot, the ESP32 starts in `WIFI_AP_STA` mode and creates a setup access point:
 - SSID: `ESP32_NOISE_Setup`
 - Password: `12345678`
 
-3. Open in browser:
-
+Connect to the AP and open:
 - `http://192.168.4.1/`
 
-4. Scan Wi-Fi, connect, and save credentials
-5. Once STA connects, the device shows its router IP in the UI
+If the ESP32 later connects to your router Wi‑Fi, the UI will show the assigned STA IP. You can then open:
+- `http://<device_sta_ip>/`
 
-The AP automatically turns off after a short grace period.
+### Main endpoints (HTTP)
+- `GET /`
+  - Admin UI
+- `GET /scan`
+  - Wi‑Fi scan results (JSON)
+- `POST/GET /save?ssid=...&password=...`
+  - Save Wi‑Fi credentials (stored in NVS) and attempt connection
+- `GET /status`
+  - Device status (JSON)
+- `GET /events`
+  - Device event log (text)
+- `GET /monitor`
+  - Live monitor stream (text)
 
----
+Admin controls (requires admin login via Supabase in the UI):
+- `POST /setThresholds`
+- `POST /setAlertConfig`
+- `POST /setLedBrightness`
+- `POST /setNoiseLedsEnabled`
+- `POST /setMicEnabled`
+- `POST /setSerialLogging`
+- `POST /setStatusRgb`
+- `POST /setDbLogConfig`
+- `POST /setSpeaker`
+- `POST /setMp3Volume`
+- `GET /playTest001`, `/playTest002`, `/playTest003`
+- `POST /stopMp3`
+
+Diagnostics:
+- `GET /sdinfo`
+- `GET /sdreinit`
+- `GET /rtcinfo`
+- `GET /rtcsync`
+
+## Data Storage (SD Card)
+Files used by firmware:
+- `/noise_log.txt`
+  - Human-readable log
+- `/pending_events.txt`
+  - Queue of unsent events to be synced to Supabase
+- `/db_series.txt`
+  - Time-series dB logs for bulk upload
+- `/rec_YYYYMMDD_HHMMSS.wav` (or `/rec_<millis>.wav`)
+  - 5-second WAV clips for major events
+
+## Supabase / Backend Requirements
+The firmware uses **Supabase REST + Storage**. It expects:
+- A Supabase project URL
+- An API key (currently embedded in firmware)
+- Database tables for:
+  - `noise_events`
+  - `noise_event_audio`
+  - `noise_db_series`
+  - `profiles` (to check `role` for admin)
+- A Storage bucket named: `recordings`
+
+### Tables used (fields used by firmware)
+#### `noise_events`
+The firmware upserts (`on_conflict=id`) with payload including:
+- `id` (uuid)
+- `event_group_id` (uuid)
+- `device_id` (string)
+- `warning_level` (FIRST/SECOND/MAJOR)
+- `warning_color` (currently always `RED`)
+- `duration_seconds` (int)
+- `decibel` (int)
+- `event_ts_ms` (bigint, optional if time is set)
+- `audio_url` (string, only for MAJOR)
+- `buzzer_triggered` (bool)
+- `audio_recorded` (bool)
+
+#### `noise_event_audio`
+Upserted (`on_conflict=noise_event_id`) with:
+- `noise_event_id` (uuid)
+- `audio_url` (string)
+- `audio_seconds` (int, firmware uses 5)
+
+#### `noise_db_series`
+Bulk-inserted with:
+- `device_id` (string)
+- `ts_ms` (bigint)
+- `db10` (int)  // dB * 10
+
+#### `profiles`
+Device UI checks role via:
+- `GET /rest/v1/profiles?select=role&id=eq.<user_id>&limit=1`
+Expected field:
+- `role` (e.g., `admin`)
+
+### Authentication used by the device UI
+The device UI performs a password grant login:
+- `POST /auth/v1/token?grant_type=password`
+
+It stores the session token in browser local storage and uses it to check `profiles.role`.
+
+## Configuration Notes
+### Wi‑Fi credentials
+- Stored in ESP32 NVS (`Preferences`) namespace `wifi` keys:
+  - `ssid`
+  - `password`
+
+### Device settings
+Stored in NVS (`Preferences`) namespace `settings` including:
+- Thresholds (`yellow`, `red`)
+- Timers (`fw_ms`, `sw_ms`, `mw_ms`, `maj_int`, `sil_win`)
+- LED brightness (`ngbrt`, `nybrt`, `nrbrt`, `stbrt`)
+- Status LED colors (`sr_boot`, `sr_ap`, `sr_wifi`, `sr_noi`, `sr_off`)
+- MP3 volume (`mp3vol`) + speaker enable (`speaker`)
+- MIC enable (`micen`) + serial logging (`serlog`)
+- DB logging config (`db_samp`, `db_thr10`, `db_hb`, `db_up`)
+
+## How to Build and Upload (Arduino IDE)
+### Prerequisites
+- Arduino IDE
+- ESP32 board support installed (Arduino-ESP32)
+- USB driver for your ESP32 board (if needed)
+
+### Steps
+1. Open `releasev1.ino` in Arduino IDE.
+2. Select board:
+   - Tools -> Board -> ESP32 Arduino -> (your ESP32 board)
+3. Select port:
+   - Tools -> Port -> (your COM port)
+4. Upload.
+5. Open Serial Monitor at `115200` baud for logs.
+
+## How to Use (End-to-End)
+1. Power the device.
+2. Connect your phone/laptop to `ESP32_NOISE_Setup`.
+3. Open `http://192.168.4.1/`.
+4. Scan Wi‑Fi, choose the school network, and save credentials.
+5. Once connected, open the device using the shown STA IP (e.g., `http://192.168.1.50/`).
+6. Log in using an **admin account** (Supabase Auth). Admin role is validated via `profiles.role`.
+7. Configure thresholds, warning timers, and brightness as needed.
+8. Observe live monitor and logs.
+
+## Privacy, Ethics, and Safeguards
+- **No continuous recording**: audio is recorded only for confirmed MAJOR violations.
+- **No live listening**: the device does not provide streaming audio.
+- **Short duration**: audio clips are limited to **5 seconds**.
+- **Access control**: admin UI requires authentication; backend dashboard should enforce RBAC.
+- Recommended institutional controls:
+  - Notice/consent policy
+  - Retention policy (e.g., auto delete within 7–14 days)
+  - Audit logging of access to recordings
 
 ## Troubleshooting
+### Cannot find the AP / cannot open setup page
+- Ensure the device is powered and ESP32 is running.
+- Connect to SSID `ESP32_NOISE_Setup` with password `12345678`.
+- Open `http://192.168.4.1/`.
 
-### Device feels “paused” during sync
+### Wi‑Fi connects but no internet
+- The status LED may indicate “Connected (No Internet)”.
+- Check firewall/captive portal requirements in the network.
+- The firmware checks internet via `http://clients3.google.com/generate_204`.
 
-- Supabase HTTP calls are synchronous.
-- This firmware reduces overhead by:
-  - bulk inserting non-audio events
-  - processing a limited batch per run with a time budget
+### SD card not detected
+- Confirm wiring and correct SD module voltage level.
+- Use UI diagnostic `GET /sdinfo`.
+- Re-init from UI (`/sdreinit`).
 
-If you need absolutely non-blocking behavior, the next step would be moving sync into a separate FreeRTOS task.
+### MP3 module not detected
+- Verify UART wiring (ESP32 RX2 GPIO16 to MP3 TX, ESP32 TX2 GPIO17 to MP3 RX).
+- Verify power and speaker connection.
+- Use UI MP3 test buttons.
 
-### Pending events never clear
+### MIC reads 0 / “MIC error detected”
+- Check INMP441 wiring and correct pin mapping.
+- Ensure common ground.
+- Check I2S pins: WS=25, SCK=26, SD=33.
 
-Common causes:
+### Supabase sync errors
+- Ensure Wi‑Fi internet access.
+- Verify Supabase URL, API key, table policies, and Storage bucket.
+- Check `/events` log for HTTP errors.
 
-- SD card not mounted / failing
-- Supabase insert rejected (schema mismatch)
+## Security Notes (Important)
+- **Do not ship hardcoded secrets**.
+- This firmware currently contains `SUPABASE_URL` and `SUPABASE_API_KEY` in source.
+  - For production/capstone demonstrations, prefer:
+    - using a restricted key,
+    - applying strict RLS policies,
+    - rotating keys after demo,
+    - or moving secrets to a provisioning flow.
 
-Check:
+## Future Improvements
+- SPL calibration workflow and per-device calibration constants
+- Per-room device configuration (room/building metadata)
+- Separate teacher/admin dashboards
+- Automated retention/deletion of recordings
+- Better offline sync conflict handling and metrics
 
-- `/events` and Serial logs for HTTP status codes
-- Make sure Supabase tables contain required columns:
-  - `event_group_id`
-  - `event_ts_ms` (bigint)
-
-### Time not set / timestamps are 0
-
-`getEpochMs()` returns `0` until NTP time is valid.
-
-- Ensure the device has internet access
-- Wait a few seconds after boot
-
-### LED color looks inconsistent with thresholds
-
-LED transitions:
-
-- RED turns on at `>= RED_THRESHOLD`
-- Falling hysteresis uses `HYSTERESIS_DB = 3`
-
----
-
-## Security notes
-
-- Supabase URL/key are currently compiled into firmware.
-- The web UI performs login from the browser and uses the Supabase anon key.
-- Do not publish keys in public repos.
-
----
+## Authors / Acknowledgements
+(Insert your group members, adviser, and institution here.)
 
 ## License
-
-Add your license here.
+(Add your license here if required by your capstone/institution.)
