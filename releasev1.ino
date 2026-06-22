@@ -146,10 +146,12 @@ void initLedPwm();
 void setNoiseLedPwm(LedState s);
 void updateStatusLed(unsigned long now);
 void delayWithStatus(unsigned long ms);
+void yieldToWeb(unsigned long ms);
 void presetToRgb(int preset, int intensity, int &r, int &g, int &b);
 
 void markSupabaseFail();
 void markSupabaseOk();
+void schedulePendingSync(unsigned long delayMs);
 void updateSdAvailability(unsigned long now);
 
 static uint8_t bcd2bin(uint8_t v);
@@ -202,11 +204,13 @@ const unsigned long SUPABASE_SYNC_INTERVAL_MS = 3000;
 unsigned long lastSupabaseSyncTime = 0;
 
 const unsigned long SYNC_RETRY_BACKOFF_MS = 30000;
+const unsigned long PENDING_SYNC_RETRY_BACKOFF_MS = 5000;
 unsigned long lastSyncBackoffLogMs = 0;
 const unsigned long SYNC_IO_LOG_INTERVAL_MS = 10000;
 unsigned long lastSyncIoLogMs = 0;
 
 unsigned long nextSupabaseSyncAllowedMs = 0;
+unsigned long deferPendingSyncUntilMs = 0;
 int lastPendingCountLogged = -9999;
 unsigned long lastPendingLogMs = 0;
 const unsigned long PENDING_LOG_INTERVAL_MS = 30000;
@@ -217,7 +221,10 @@ const char* DB_SERIES_PATH = "/db_series.txt";
 
 String lastRecordedWavPath = "";
 
-const unsigned long HTTP_TIMEOUT_MS = 6000;
+const unsigned long HTTP_TIMEOUT_MS = 20000;
+const unsigned long STORAGE_HTTP_TIMEOUT_MS = 90000;
+const size_t STORAGE_UPLOAD_CHUNK = 1460;
+static bool storageUploadBusy = false;
 
 bool internetOk = false;
 unsigned long lastInternetCheckMs = 0;
@@ -535,14 +542,7 @@ bool tryBulkUploadDbSeries(unsigned long now) {
   bool didUploadAny = false;
 
   while (in.available()) {
-    {
-    unsigned long t0 = millis();
     server.handleClient();
-    unsigned long dt = millis() - t0;
-    if (dt > 1000) {
-      Serial.println(String("server.handleClient stall ms=") + dt);
-    }
-  }
     yield();
 
     if (millis() - startMs > maxWorkMs) {
@@ -586,22 +586,32 @@ bool tryBulkUploadDbSeries(unsigned long now) {
     }
     body += "]";
 
+    server.handleClient();
+    yield();
+
     int postCode = 0;
     String resp;
     String url = String(SUPABASE_URL) + "/rest/v1/noise_db_series";
     bool ok = supabasePostJson(url, body, postCode, resp);
-    if (!ok) {
-      logSupabaseStatus(getTimeString() + " | DB series upload FAIL | HTTP " + String(postCode) + " | " + truncateForLog(resp, 180));
-      for (int i = 0; i < n; i++) out.println(lines[i]);
-      while (in.available()) {
-        String rest = in.readStringUntil('\n');
-        rest.trim();
-        if (rest.length() > 0) out.println(rest);
-      }
-      break;
-    }
+    server.handleClient();
 
-    logSupabaseStatus(getTimeString() + " | DB series upload OK | HTTP " + String(postCode));
+    if (!ok) {
+      if (postCode == 409) {
+        markSupabaseOk();
+        logSupabaseStatus(getTimeString() + " | DB series upload DUPLICATE (ok) | HTTP " + String(postCode) + " | " + truncateForLog(resp, 120));
+      } else {
+        logSupabaseStatus(getTimeString() + " | DB series upload FAIL | HTTP " + String(postCode) + " | " + truncateForLog(resp, 180));
+        for (int i = 0; i < n; i++) out.println(lines[i]);
+        while (in.available()) {
+          String rest = in.readStringUntil('\n');
+          rest.trim();
+          if (rest.length() > 0) out.println(rest);
+        }
+        break;
+      }
+    } else {
+      logSupabaseStatus(getTimeString() + " | DB series upload OK | HTTP " + String(postCode));
+    }
 
     didUploadAny = true;
   }
@@ -661,34 +671,172 @@ int countPendingEventsOnSD() {
 }
 
 bool supabasePostJson(const String &url, const String &jsonBody, int &httpCodeOut, String &responseOut) {
-  WiFiClientSecure client;
-  client.setInsecure();
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) yieldToWeb(500);
 
-  HTTPClient http;
-  if (!http.begin(client, url)) {
-    httpCodeOut = -1;
-    responseOut = "begin_failed";
-    markSupabaseFail();
-    return false;
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+      httpCodeOut = -1;
+      responseOut = "begin_failed";
+      continue;
+    }
+
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("apikey", SUPABASE_API_KEY);
+    http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
+    http.addHeader("Prefer", "return=representation,resolution=merge-duplicates");
+
+    server.handleClient();
+    yield();
+    httpCodeOut = http.POST((uint8_t*)jsonBody.c_str(), jsonBody.length());
+    responseOut = http.getString();
+    http.end();
+    server.handleClient();
+
+    if (httpCodeOut > 0) break;
   }
 
-  http.setTimeout(HTTP_TIMEOUT_MS);
-
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", SUPABASE_API_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
-  http.addHeader("Prefer", "return=representation,resolution=merge-duplicates");
-
-  httpCodeOut = http.POST((uint8_t*)jsonBody.c_str(), jsonBody.length());
-  responseOut = http.getString();
-  http.end();
   bool ok = (httpCodeOut >= 200 && httpCodeOut < 300);
   if (ok) markSupabaseOk();
   else markSupabaseFail();
   return ok;
 }
 
+static String supabaseHostFromUrl() {
+  String host = String(SUPABASE_URL);
+  host.replace("https://", "");
+  host.replace("http://", "");
+  int slash = host.indexOf('/');
+  if (slash >= 0) host.remove(slash);
+  return host;
+}
+
+static bool readHttpResponse(WiFiClientSecure &client, int &statusOut, String &bodyOut) {
+  unsigned long deadline = millis() + 30000;
+  while (!client.available()) {
+    if (millis() > deadline) return false;
+    delay(10);
+    yield();
+    server.handleClient();
+  }
+
+  String statusLine = client.readStringUntil('\n');
+  statusLine.trim();
+  int sp1 = statusLine.indexOf(' ');
+  int sp2 = (sp1 >= 0) ? statusLine.indexOf(' ', sp1 + 1) : -1;
+  statusOut = 0;
+  if (sp1 > 0 && sp2 > sp1) statusOut = statusLine.substring(sp1 + 1, sp2).toInt();
+
+  while (client.connected() || client.available()) {
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) break;
+    if (millis() > deadline) break;
+  }
+
+  bodyOut = "";
+  while (client.available() && bodyOut.length() < 384) {
+    bodyOut += (char)client.read();
+  }
+  return statusOut > 0;
+}
+
+static bool httpsPutWavChunked(const String &objectPath, File &f, size_t fileSize, int &httpCodeOut, String &responseOut) {
+  String host = supabaseHostFromUrl();
+  String path = "/storage/v1/object/recordings/" + objectPath;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(STORAGE_HTTP_TIMEOUT_MS / 1000UL);
+
+  if (!client.connect(host.c_str(), 443)) {
+    httpCodeOut = -1;
+    responseOut = "connect_failed";
+    return false;
+  }
+
+  String req;
+  req.reserve(640);
+  req += "PUT ";
+  req += path;
+  req += " HTTP/1.1\r\nHost: ";
+  req += host;
+  req += "\r\nContent-Type: audio/wav\r\nContent-Length: ";
+  req += String((unsigned long)fileSize);
+  req += "\r\napikey: ";
+  req += SUPABASE_API_KEY;
+  req += "\r\nAuthorization: Bearer ";
+  req += SUPABASE_API_KEY;
+  req += "\r\nx-upsert: true\r\nConnection: close\r\n\r\n";
+
+  if (client.print(req) != (int)req.length()) {
+    httpCodeOut = -2;
+    responseOut = "header_send_failed";
+    client.stop();
+    return false;
+  }
+
+  uint8_t buf[STORAGE_UPLOAD_CHUNK];
+  size_t sent = 0;
+  while (sent < fileSize) {
+    size_t want = fileSize - sent;
+    if (want > STORAGE_UPLOAD_CHUNK) want = STORAGE_UPLOAD_CHUNK;
+    size_t n = f.read(buf, want);
+    if (n == 0) {
+      httpCodeOut = -3;
+      responseOut = "sd_read_short";
+      client.stop();
+      return false;
+    }
+
+    size_t off = 0;
+    while (off < n) {
+      int w = client.write(buf + off, n - off);
+      if (w <= 0) {
+        httpCodeOut = -3;
+        responseOut = "payload_write_failed";
+        client.stop();
+        return false;
+      }
+      off += (size_t)w;
+    }
+    sent += n;
+
+    if ((sent % (STORAGE_UPLOAD_CHUNK * 8)) == 0) {
+      server.handleClient();
+      yield();
+    }
+  }
+
+  if (!readHttpResponse(client, httpCodeOut, responseOut)) {
+    if (httpCodeOut <= 0) httpCodeOut = -11;
+    if (responseOut.length() == 0) responseOut = "response_timeout";
+    client.stop();
+    return false;
+  }
+
+  client.stop();
+  return (httpCodeOut >= 200 && httpCodeOut < 300);
+}
+
 bool supabaseUploadFileToRecordsBucket(const String &objectPath, const String &localFilePath, int &httpCodeOut, String &responseOut) {
+  if (storageUploadBusy) {
+    httpCodeOut = -1;
+    responseOut = "upload_busy";
+    return false;
+  }
+
+  if (!SD.exists(localFilePath.c_str())) {
+    httpCodeOut = -1;
+    responseOut = "file_missing";
+    markSupabaseFail();
+    return false;
+  }
+
   File f = SD.open(localFilePath.c_str(), FILE_READ);
   if (!f) {
     httpCodeOut = -1;
@@ -697,31 +845,37 @@ bool supabaseUploadFileToRecordsBucket(const String &objectPath, const String &l
     return false;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  String url = String(SUPABASE_URL) + "/storage/v1/object/recordings/" + objectPath;
-  if (!http.begin(client, url)) {
-    httpCodeOut = -1;
-    responseOut = "begin_failed";
-    markSupabaseFail();
+  const size_t fileSize = f.size();
+  if (fileSize == 0) {
     f.close();
+    httpCodeOut = -1;
+    responseOut = "file_empty";
+    markSupabaseFail();
     return false;
   }
 
-  http.setTimeout(HTTP_TIMEOUT_MS);
+  storageUploadBusy = true;
+  logSupabaseStatus(getTimeString() + " | Supabase upload begin | bytes=" + String((unsigned long)fileSize));
 
-  http.addHeader("Content-Type", "audio/wav");
-  http.addHeader("apikey", SUPABASE_API_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
-  http.addHeader("x-upsert", "true");
+  bool ok = false;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      yieldToWeb(1500);
+      f.seek(0);
+    }
 
-  httpCodeOut = http.sendRequest("PUT", &f, f.size());
-  responseOut = http.getString();
-  http.end();
+    server.handleClient();
+    yield();
+    ok = httpsPutWavChunked(objectPath, f, fileSize, httpCodeOut, responseOut);
+    if (ok) break;
+    if (httpCodeOut > 0) break;
+  }
+
   f.close();
-  return (httpCodeOut >= 200 && httpCodeOut < 300);
+  storageUploadBusy = false;
+
+  if (!ok) markSupabaseFail();
+  return ok;
 }
 
 String makeStorageObjectPath(const String &eventId) {
@@ -751,7 +905,8 @@ bool sendNoiseEventToSupabase(
     int upCode = 0;
     String upResp;
     if (!supabaseUploadFileToRecordsBucket(objPath, audioLocalPath, upCode, upResp)) {
-      logSupabaseStatus(getTimeString() + " | Supabase upload FAIL | " + eventId + " | HTTP " + String(upCode) + " | " + truncateForLog(upResp, 180));
+      logSupabaseStatus(getTimeString() + " | Supabase upload FAIL | " + eventId + " | HTTP " + String(upCode) + " | " + truncateForLog(upResp, 120));
+      schedulePendingSync(30000);
       return false;
     }
     logSupabaseStatus(getTimeString() + " | Supabase upload OK | " + eventId + " | HTTP " + String(upCode));
@@ -783,6 +938,7 @@ bool sendNoiseEventToSupabase(
   String response;
   if (!supabasePostJson(url, body, postCode, response)) {
     if (postCode == 409) {
+      markSupabaseOk();
       logSupabaseStatus(getTimeString() + " | Supabase insert noise_events DUPLICATE (ok) | " + eventId + " | HTTP " + String(postCode) + " | " + truncateForLog(response, 180));
     } else {
       logSupabaseStatus(getTimeString() + " | Supabase insert noise_events FAIL | " + eventId + " | HTTP " + String(postCode) + " | " + truncateForLog(response, 180));
@@ -807,6 +963,7 @@ bool sendNoiseEventToSupabase(
     String response2;
     if (!supabasePostJson(url2, body2, post2Code, response2)) {
       if (post2Code == 409) {
+        markSupabaseOk();
         logSupabaseStatus(getTimeString() + " | Supabase insert noise_event_audio DUPLICATE (ok) | " + eventId + " | HTTP " + String(post2Code) + " | " + truncateForLog(response2, 180));
       } else {
         logSupabaseStatus(getTimeString() + " | Supabase insert noise_event_audio FAIL | " + eventId + " | HTTP " + String(post2Code) + " | " + truncateForLog(response2, 180));
@@ -866,17 +1023,13 @@ void queueRedWarningEvent(const String &warningLevel, uint64_t eventTsMs, const 
   }
   logSupabaseStatus(msg);
 
-  // Immediate sync when online (may block briefly); batching below reduces repeated overhead.
-  if (wifiConnected && supabaseConfigured()) {
-    if (millis() >= nextSupabaseSyncAllowedMs) {
-      int uploaded = trySyncPendingEvents();
-      if (uploaded > 0) {
-        nextSupabaseSyncAllowedMs = millis();
-      } else {
-        nextSupabaseSyncAllowedMs = millis() + SYNC_RETRY_BACKOFF_MS;
-      }
-    }
-  }
+  // Defer sync so HTTP does not run during MP3 playback / right after recording.
+  schedulePendingSync(audioRecorded ? 5000 : 1200);
+}
+
+void schedulePendingSync(unsigned long delayMs) {
+  unsigned long when = millis() + delayMs;
+  if (when > deferPendingSyncUntilMs) deferPendingSyncUntilMs = when;
 }
 
 void handleScanNetworks() {
@@ -947,6 +1100,11 @@ void handleScanNetworks() {
 
 int trySyncPendingEvents() {
   if (!wifiConnected) return 0;
+  if (storageUploadBusy) return 0;
+  if (!internetOk) {
+    logSupabaseStatus(getTimeString() + " | Supabase sync skipped: no internet");
+    return 0;
+  }
 
   unsigned long now = millis();
   if (!sdAvailable && (lastSdFailMs != 0) && (now - lastSdFailMs < SYNC_RETRY_BACKOFF_MS)) {
@@ -966,7 +1124,7 @@ int trySyncPendingEvents() {
   if (!supabaseConfigured()) return 0;
 
   unsigned long startMs = 0;
-  const unsigned long maxWorkMs = 1200;
+  const unsigned long maxWorkMs = 25000;
   int okCount = 0;
   int processedCount = 0;
   bool loggedFirstLine = false;
@@ -1029,9 +1187,15 @@ int trySyncPendingEvents() {
     String resp;
     bool ok = supabasePostJson(url, body, postCode, resp);
     if (!ok) {
-      logSupabaseStatus(getTimeString() + " | Supabase bulk insert FAIL | HTTP " + String(postCode) + " | " + truncateForLog(resp, 180));
-      for (int i = 0; i < batchLineCount; i++) out.println(batchLines[i]);
-      markSupabaseFail();
+      if (postCode == 409) {
+        markSupabaseOk();
+        okCount += batchCount;
+        logSupabaseStatus(getTimeString() + " | Supabase bulk insert DUPLICATE (ok) | count=" + String(batchCount) + " | HTTP " + String(postCode));
+      } else {
+        logSupabaseStatus(getTimeString() + " | Supabase bulk insert FAIL | HTTP " + String(postCode) + " | " + truncateForLog(resp, 180));
+        for (int i = 0; i < batchLineCount; i++) out.println(batchLines[i]);
+        markSupabaseFail();
+      }
     } else {
       markSupabaseOk();
       okCount += batchCount;
@@ -1169,6 +1333,7 @@ int trySyncPendingEvents() {
       if (!ok) {
         logSupabaseStatus(getTimeString() + " | Supabase sync FAIL (kept pending) | " + eventId);
         markSupabaseFail();
+        if (audioRecorded) schedulePendingSync(30000);
         out.println(line);
       } else {
         markSupabaseOk();
@@ -1565,12 +1730,18 @@ void presetToRgb(int preset, int intensity, int &r, int &g, int &b) {
   }
 }
 
-void delayWithStatus(unsigned long ms) {
+void yieldToWeb(unsigned long ms) {
   unsigned long start = millis();
   while (millis() - start < ms) {
+    server.handleClient();
     updateStatusLed(millis());
+    yield();
     delay(10);
   }
+}
+
+void delayWithStatus(unsigned long ms) {
+  yieldToWeb(ms);
 }
 
 String getTimeString() {
@@ -1970,17 +2141,30 @@ static void probeMp3() {
   }
 }
 
-void handleRoot() {
-  String html = FPSTR(INDEX_HTML);
-  html.replace("__SUPABASE_URL__", String(SUPABASE_URL));
-  html.replace("__SUPABASE_ANON_KEY__", String(SUPABASE_API_KEY));
+void handleConfigJs() {
   server.sendHeader("Cache-Control", "no-store");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "0");
-  server.send(200, "text/html", html);
+  String js;
+  js.reserve(320);
+  js += "window.SUPABASE_URL=\"";
+  js += jsonEscape(String(SUPABASE_URL));
+  js += "\";window.SUPABASE_ANON_KEY=\"";
+  js += jsonEscape(String(SUPABASE_API_KEY));
+  js += "\";";
+  server.send(200, "application/javascript", js);
+}
+
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.send_P(200, "text/html", INDEX_HTML);
 }
 
 void handleStatus() {
+  server.handleClient();
+  yield();
   String ssid = (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : String("");
   int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
   String out;
@@ -2651,6 +2835,7 @@ void setup() {
   connectToWiFi();
 
   server.on("/", handleRoot);
+  server.on("/config.js", handleConfigJs);
   server.on("/save", handleNetworkConnection);
   server.on("/scan", handleScanNetworks);
   server.on("/status", handleStatus);
@@ -2748,17 +2933,6 @@ void loop() {
   }
   lastStaConnected = staNowConnected;
 
-  static unsigned long lastLoopMs = 0;
-  static unsigned long lastLoopStallLogMs = 0;
-  if (lastLoopMs != 0) {
-    unsigned long dt = now - lastLoopMs;
-    if (dt > 1500 && ((lastLoopStallLogMs == 0) || (now - lastLoopStallLogMs > 5000))) {
-      lastLoopStallLogMs = now;
-      Serial.println(String("Loop stall ms=") + dt + " | WiFiMode=" + String((int)WiFi.getMode()) + " | sta=" + String((int)WiFi.status()));
-    }
-  }
-  lastLoopMs = now;
-
   while (mp3.available()) {
     (void)mp3.read();
     lastMp3RxMs = now;
@@ -2790,22 +2964,15 @@ void loop() {
     lastSupaErrState = supaErrNow;
   }
 
-  // Auto turn off Setup AP after grace period once STA is connected
-  if (wifiConnected && (WiFi.status() == WL_CONNECTED) && (apGraceUntilMs > 0) && (now > apGraceUntilMs)) {
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
-    apGraceUntilMs = 0;
-    logNetworkInfo("AP turned off");
-  }
-
-  {
-    unsigned long t0 = millis();
-    updateStatusLed(now);
-    unsigned long dt = millis() - t0;
-    if (dt > 1000) {
-      Serial.println(String("updateStatusLed stall ms=") + dt);
+  // Keep Setup AP running alongside STA so the web UI stays reachable on both networks.
+  if (wifiConnected && (WiFi.status() == WL_CONNECTED) && (WiFi.getMode() != WIFI_AP_STA)) {
+    WiFi.mode(WIFI_AP_STA);
+    if (WiFi.softAPIP().toString() == "0.0.0.0") {
+      WiFi.softAP("ESP32_NOISE_Setup", "12345678");
     }
   }
+
+  updateStatusLed(now);
 
   // Single-attempt reconnect policy: after a failure, suppress further WiFi.begin() calls for a cooldown.
   if (staSuppressed) {
@@ -2817,18 +2984,13 @@ void loop() {
         wifiConnecting = false;
         WiFi.disconnect(false, false);
       }
-      delay(50);
+      yieldToWeb(50);
       return;
     }
   }
 
   if (staNowConnected && (now - lastInternetCheckMs >= INTERNET_CHECK_INTERVAL_MS)) {
-    unsigned long t0 = millis();
     internetOk = checkInternetNow();
-    unsigned long dt = millis() - t0;
-    if (dt > 1500) {
-      Serial.println(String("checkInternetNow stall ms=") + dt + " | sta=" + String((int)WiFi.status()));
-    }
     lastInternetCheckMs = now;
   }
 
@@ -2870,7 +3032,7 @@ void loop() {
       staSuppressedUntilMs = now + 60000;
       nextWifiRetryAllowedMs = staSuppressedUntilMs;
       // Do not fall through into retry logic in the same loop iteration.
-      delay(50);
+      yieldToWeb(50);
       return;
     }
   }
@@ -2878,12 +3040,7 @@ void loop() {
   if (now - lastSupabaseSyncTime >= SUPABASE_SYNC_INTERVAL_MS) {
     if (!staNowConnected) {
       if ((lastPendingLogMs == 0) || (now - lastPendingLogMs >= PENDING_LOG_INTERVAL_MS)) {
-        unsigned long t0 = millis();
         int pending = countPendingEventsOnSD();
-        unsigned long dt = millis() - t0;
-        if (dt > 1500) {
-          Serial.println(String("countPendingEventsOnSD stall ms=") + dt);
-        }
         if (pending >= 0 && (pending != lastPendingCountLogged || lastPendingLogMs == 0 || (now - lastPendingLogMs >= PENDING_LOG_INTERVAL_MS))) {
           lastPendingCountLogged = pending;
           lastPendingLogMs = now;
@@ -2897,8 +3054,15 @@ void loop() {
         lastPendingLogMs = now;
         if (pending > 0) logSupabaseStatus(getTimeString() + " | Supabase sync skipped: not configured | pending=" + String(pending));
       }
+    } else if (!internetOk) {
+      int pending = countPendingEventsOnSD();
+      if (pending >= 0 && (pending != lastPendingCountLogged || (lastPendingLogMs == 0) || (now - lastPendingLogMs >= PENDING_LOG_INTERVAL_MS))) {
+        lastPendingCountLogged = pending;
+        lastPendingLogMs = now;
+        if (pending > 0) logSupabaseStatus(getTimeString() + " | Supabase sync skipped: no internet | pending=" + String(pending));
+      }
     } else {
-      if (now >= nextSupabaseSyncAllowedMs) {
+      if (now >= nextSupabaseSyncAllowedMs && now >= deferPendingSyncUntilMs) {
         int pending = countPendingEventsOnSD();
         if (pending >= 0 && (pending != lastPendingCountLogged || (lastPendingLogMs == 0) || (now - lastPendingLogMs >= PENDING_LOG_INTERVAL_MS))) {
           lastPendingCountLogged = pending;
@@ -2911,7 +3075,7 @@ void loop() {
           if (uploaded > 0) {
             nextSupabaseSyncAllowedMs = now;
           } else {
-            nextSupabaseSyncAllowedMs = now + SYNC_RETRY_BACKOFF_MS;
+            nextSupabaseSyncAllowedMs = now + PENDING_SYNC_RETRY_BACKOFF_MS;
           }
         }
       }
@@ -2920,18 +3084,11 @@ void loop() {
   }
 
   if (!micEnabled) {
-    delay(50);
+    yieldToWeb(50);
     return;
   }
 
-  {
-    unsigned long t0 = millis();
-    rawDB = readMicDB();
-    unsigned long dt = millis() - t0;
-    if (dt > 1000) {
-      Serial.println(String("readMicDB stall ms=") + dt);
-    }
-  }
+  rawDB = readMicDB();
   smoothDB = smoothDB + SMOOTH_ALPHA * (rawDB - smoothDB);
   int avgDB = getMovingAverage((int)smoothDB);
 
@@ -2963,12 +3120,7 @@ void loop() {
     if (changed || heartbeatDue) {
       uint64_t tsMs = getEpochMs();
       if (tsMs != 0) {
-        unsigned long t0 = millis();
         bool ok = appendDbSeriesRecord(tsMs, db10);
-        unsigned long dt = millis() - t0;
-        if (dt > 1000) {
-          Serial.println(String("appendDbSeriesRecord stall ms=") + dt);
-        }
         if (ok) {
           lastDbLogged10 = db10;
           lastDbRecordMs = now;
@@ -3007,19 +3159,13 @@ void loop() {
   if ((now - lastLogTime >= LOG_INTERVAL_MS) &&
       abs((int)smoothDB - lastLoggedDB) >= DB_CHANGE_LOG) {
 
-    {
-      unsigned long t0 = millis();
-      logNoise((int)smoothDB);
-      unsigned long dt = millis() - t0;
-      if (dt > 1000) {
-        Serial.println(String("logNoise stall ms=") + dt);
-      }
-    }
+    logNoise((int)smoothDB);
     lastLoggedDB = (int)smoothDB;
     lastLogTime = now;
   }
 
-  delay(50);
+  server.handleClient();
+  yieldToWeb(50);
 }
 
 // ================= MIC =================
@@ -3116,9 +3262,9 @@ void handleRedWarnings(int value, unsigned long now) {
       uint64_t tsMs = getEpochMs();
       logEvent((String("MAJOR WARNING (RED ") + String(majorCfgSec) + "s)").c_str());
       flickerActiveLed();
-      recordINMP441Wav5s();
+      bool recorded = recordINMP441Wav5s();
       playMP3(0x03);     // 003.mp3
-      queueRedWarningEvent("MAJOR", tsMs, currentViolationGroupId, majorCfgSec, value, true, lastRecordedWavPath);
+      queueRedWarningEvent("MAJOR", tsMs, currentViolationGroupId, majorCfgSec, value, recorded, recorded ? lastRecordedWavPath : "");
       majorLogged = true;
       lastMajorAlertMs = now;
     }
@@ -3127,9 +3273,9 @@ void handleRedWarnings(int value, unsigned long now) {
       uint64_t tsMs = getEpochMs();
       logEvent("MAJOR WARNING (REPEAT)");
       flickerActiveLed();
-      recordINMP441Wav5s();
+      bool recorded = recordINMP441Wav5s();
       playMP3(0x03);
-      queueRedWarningEvent("MAJOR", tsMs, currentViolationGroupId, elapsedSeconds, value, true, lastRecordedWavPath);
+      queueRedWarningEvent("MAJOR", tsMs, currentViolationGroupId, elapsedSeconds, value, recorded, recorded ? lastRecordedWavPath : "");
       lastMajorAlertMs = now;
     }
   } else {
