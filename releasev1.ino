@@ -4,7 +4,7 @@
 #include <time.h>
 #include <Wire.h>
 #include <HardwareSerial.h>     // ✅ ADDED
-#include "types.h"
+#include "../types.h"
 #include "driver/i2s.h"
 #include <math.h>
 #include <WebServer.h>
@@ -13,7 +13,7 @@
 #include <WiFiClientSecure.h>
 #include <esp_wifi_types.h>
 #include <esp_sntp.h>
-#include "web_ui.h"
+// #include "web_ui.h"  // REMOVED - Flutter app replaces web UI
 
 // ================= LED PWM =================
 // LEDC PWM is used so we can support brightness sliders.
@@ -187,6 +187,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 }
 
 void handleSetDbLogConfig();
+void handleStaIp();
 bool appendDbSeriesRecord(uint64_t tsMs, int db10);
 bool tryBulkUploadDbSeries(unsigned long now);
 uint64_t getEpochMs();
@@ -2141,27 +2142,6 @@ static void probeMp3() {
   }
 }
 
-void handleConfigJs() {
-  server.sendHeader("Cache-Control", "no-store");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "0");
-  String js;
-  js.reserve(320);
-  js += "window.SUPABASE_URL=\"";
-  js += jsonEscape(String(SUPABASE_URL));
-  js += "\";window.SUPABASE_ANON_KEY=\"";
-  js += jsonEscape(String(SUPABASE_API_KEY));
-  js += "\";";
-  server.send(200, "application/javascript", js);
-}
-
-void handleRoot() {
-  server.sendHeader("Cache-Control", "no-store");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "0");
-  server.send_P(200, "text/html", INDEX_HTML);
-}
-
 void handleStatus() {
   server.handleClient();
   yield();
@@ -2522,6 +2502,11 @@ void handleSetSpeaker() {
   server.send(204);
 }
 
+void handleStaIp() {
+  String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("");
+  server.send(200, "text/plain", ip);
+}
+
 void handleDisconnect() {
   preferences.begin("wifi", false);
   preferences.remove("ssid");
@@ -2834,8 +2819,7 @@ void setup() {
   logNetworkInfo("Boot");
   connectToWiFi();
 
-  server.on("/", handleRoot);
-  server.on("/config.js", handleConfigJs);
+  // Web UI routes removed - Flutter app is the only frontend
   server.on("/save", handleNetworkConnection);
   server.on("/scan", handleScanNetworks);
   server.on("/status", handleStatus);
@@ -2844,6 +2828,7 @@ void setup() {
   server.on("/toggleSpeaker", handleToggleSpeaker);
   server.on("/setSpeaker", handleSetSpeaker);
   server.on("/disconnect", handleDisconnect);
+  server.on("/sta_ip", handleStaIp);
   server.on("/playTest001", handlePlayTest001);
   server.on("/playTest002", handlePlayTest002);
   server.on("/playTest003", handlePlayTest003);
