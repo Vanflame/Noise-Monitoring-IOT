@@ -4,7 +4,7 @@
 #include <time.h>
 #include <Wire.h>
 #include <HardwareSerial.h>     // ✅ ADDED
-#include "types.h"
+#include "../types.h"
 #include "driver/i2s.h"
 #include <math.h>
 #include <WebServer.h>
@@ -13,7 +13,7 @@
 #include <WiFiClientSecure.h>
 #include <esp_wifi_types.h>
 #include <esp_sntp.h>
-#include "web_ui.h"
+// #include "web_ui.h"  // REMOVED - Flutter app replaces web UI
 
 // ================= LED PWM =================
 // LEDC PWM is used so we can support brightness sliders.
@@ -187,6 +187,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 }
 
 void handleSetDbLogConfig();
+void handleStaIp();
 bool appendDbSeriesRecord(uint64_t tsMs, int db10);
 bool tryBulkUploadDbSeries(unsigned long now);
 uint64_t getEpochMs();
@@ -302,6 +303,9 @@ int noiseRedBrt = 80;
 int statusLedBrt = 40;
 
 bool noiseLedsEnabled = true;
+
+// Temporary: suppress green/yellow traffic-light output (state logic unchanged).
+static const bool NOISE_LED_GREEN_YELLOW_OUTPUT_ENABLED = false;
 
 bool micEnabled = true;
 bool serialLoggingEnabled = true;
@@ -507,8 +511,31 @@ bool appendDbSeriesRecord(uint64_t tsMs, int db10) {
   return true;
 }
 
+static bool dbSeriesFieldIsUint(const String &s) {
+  if (s.length() == 0 || s.length() > 20) return false;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c < '0' || c > '9') return false;
+  }
+  return true;
+}
+
+static bool parseDbSeriesLine(const String &line, String &tsOut, String &db10Out) {
+  int p = line.indexOf('|');
+  if (p <= 0) return false;
+  tsOut = line.substring(0, p);
+  db10Out = line.substring(p + 1);
+  tsOut.trim();
+  db10Out.trim();
+  return dbSeriesFieldIsUint(tsOut) && dbSeriesFieldIsUint(db10Out);
+}
+
 bool tryBulkUploadDbSeries(unsigned long now) {
   (void)now;
+  if (storageUploadBusy) {
+    logSupabaseStatus(getTimeString() + " | DB series upload skipped: storage upload busy");
+    return false;
+  }
   if (!wifiConnected) {
     logSupabaseStatus(getTimeString() + " | DB series upload skipped: offline");
     return false;
@@ -536,8 +563,9 @@ bool tryBulkUploadDbSeries(unsigned long now) {
   }
 
   unsigned long startMs = millis();
-  const unsigned long maxWorkMs = 800;
-  const int maxBatch = 120;
+  const unsigned long maxWorkMs = 15000;
+  // Keep batches small: 120-row JSON posts exhaust heap/SSL and return HTTP -1.
+  const int maxBatch = 20;
 
   bool didUploadAny = false;
 
@@ -567,32 +595,42 @@ bool tryBulkUploadDbSeries(unsigned long now) {
 
     logSupabaseStatus(getTimeString() + " | DB series upload: batch=" + String(n));
 
-    String body = "[";
+    String body;
+    body.reserve((size_t)n * 72 + 16);
+    body += "[";
+    int validCount = 0;
     for (int i = 0; i < n; i++) {
-      int p = lines[i].indexOf('|');
-      if (p < 0) {
-        // malformed; keep it
+      String ts;
+      String db10s;
+      if (!parseDbSeriesLine(lines[i], ts, db10s)) {
         out.println(lines[i]);
         continue;
       }
-      String ts = lines[i].substring(0, p);
-      String db10s = lines[i].substring(p + 1);
-      if (body.length() > 1) body += ",";
+      if (validCount > 0) body += ",";
       body += "{";
       body += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
       body += "\"ts_ms\":" + ts + ",";
       body += "\"db10\":" + db10s;
       body += "}";
+      validCount++;
     }
     body += "]";
 
+    if (validCount == 0) continue;
+    if (body.length() < 4) {
+      logSupabaseStatus(getTimeString() + " | DB series upload skipped: empty JSON body");
+      for (int i = 0; i < n; i++) out.println(lines[i]);
+      continue;
+    }
+
     server.handleClient();
-    yield();
+    yieldToWeb(100);
 
     int postCode = 0;
     String resp;
     String url = String(SUPABASE_URL) + "/rest/v1/noise_db_series";
     bool ok = supabasePostJson(url, body, postCode, resp);
+    body = String();
     server.handleClient();
 
     if (!ok) {
@@ -600,8 +638,14 @@ bool tryBulkUploadDbSeries(unsigned long now) {
         markSupabaseOk();
         logSupabaseStatus(getTimeString() + " | DB series upload DUPLICATE (ok) | HTTP " + String(postCode) + " | " + truncateForLog(resp, 120));
       } else {
-        logSupabaseStatus(getTimeString() + " | DB series upload FAIL | HTTP " + String(postCode) + " | " + truncateForLog(resp, 180));
-        for (int i = 0; i < n; i++) out.println(lines[i]);
+        logSupabaseStatus(getTimeString() + " | DB series upload FAIL | HTTP " + String(postCode)
+          + " | valid=" + String(validCount) + "/" + String(n)
+          + " | " + truncateForLog(resp, 180));
+        for (int i = 0; i < n; i++) {
+          String ts;
+          String db10s;
+          if (parseDbSeriesLine(lines[i], ts, db10s)) out.println(lines[i]);
+        }
         while (in.available()) {
           String rest = in.readStringUntil('\n');
           rest.trim();
@@ -614,6 +658,7 @@ bool tryBulkUploadDbSeries(unsigned long now) {
     }
 
     didUploadAny = true;
+    yieldToWeb(50);
   }
 
   in.close();
@@ -676,6 +721,7 @@ bool supabasePostJson(const String &url, const String &jsonBody, int &httpCodeOu
 
     WiFiClientSecure client;
     client.setInsecure();
+    client.setTimeout(HTTP_TIMEOUT_MS / 1000UL);
 
     HTTPClient http;
     if (!http.begin(client, url)) {
@@ -685,6 +731,7 @@ bool supabasePostJson(const String &url, const String &jsonBody, int &httpCodeOu
     }
 
     http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setReuse(false);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("apikey", SUPABASE_API_KEY);
     http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
@@ -692,12 +739,25 @@ bool supabasePostJson(const String &url, const String &jsonBody, int &httpCodeOu
 
     server.handleClient();
     yield();
+    if (jsonBody.length() == 0) {
+      httpCodeOut = 400;
+      responseOut = "empty_json_body";
+      http.end();
+      client.stop();
+      markSupabaseFail();
+      return false;
+    }
     httpCodeOut = http.POST((uint8_t*)jsonBody.c_str(), jsonBody.length());
     responseOut = http.getString();
     http.end();
+    client.stop();
     server.handleClient();
 
     if (httpCodeOut > 0) break;
+    if (httpCodeOut == 0) {
+      httpCodeOut = -1;
+      if (responseOut.length() == 0) responseOut = "connection_failed";
+    }
   }
 
   bool ok = (httpCodeOut >= 200 && httpCodeOut < 300);
@@ -1578,8 +1638,8 @@ void flickerActiveLed() {
     ledcWriteCompat(CH_NOISE_RED, 0);
     delay(80);
 
-    ledcWriteCompat(CH_NOISE_GREEN, g ? constrain(noiseGreenBrt, 0, LEDC_MAX) : 0);
-    ledcWriteCompat(CH_NOISE_YELLOW, y ? constrain(noiseYellowBrt, 0, LEDC_MAX) : 0);
+    ledcWriteCompat(CH_NOISE_GREEN, (NOISE_LED_GREEN_YELLOW_OUTPUT_ENABLED && g) ? constrain(noiseGreenBrt, 0, LEDC_MAX) : 0);
+    ledcWriteCompat(CH_NOISE_YELLOW, (NOISE_LED_GREEN_YELLOW_OUTPUT_ENABLED && y) ? constrain(noiseYellowBrt, 0, LEDC_MAX) : 0);
     ledcWriteCompat(CH_NOISE_RED, r ? constrain(noiseRedBrt, 0, LEDC_MAX) : 0);
     delay(80);
   }
@@ -1615,8 +1675,8 @@ void setNoiseLedPwm(LedState s) {
     ledcWriteCompat(CH_NOISE_RED, 0);
     return;
   }
-  const int g = (s == GREEN) ? constrain(noiseGreenBrt, 0, LEDC_MAX) : 0;
-  const int y = (s == YELLOW) ? constrain(noiseYellowBrt, 0, LEDC_MAX) : 0;
+  const int g = (NOISE_LED_GREEN_YELLOW_OUTPUT_ENABLED && s == GREEN) ? constrain(noiseGreenBrt, 0, LEDC_MAX) : 0;
+  const int y = (NOISE_LED_GREEN_YELLOW_OUTPUT_ENABLED && s == YELLOW) ? constrain(noiseYellowBrt, 0, LEDC_MAX) : 0;
   const int r = (s == RED) ? constrain(noiseRedBrt, 0, LEDC_MAX) : 0;
   ledcWriteCompat(CH_NOISE_GREEN, g);
   ledcWriteCompat(CH_NOISE_YELLOW, y);
@@ -2141,27 +2201,6 @@ static void probeMp3() {
   }
 }
 
-void handleConfigJs() {
-  server.sendHeader("Cache-Control", "no-store");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "0");
-  String js;
-  js.reserve(320);
-  js += "window.SUPABASE_URL=\"";
-  js += jsonEscape(String(SUPABASE_URL));
-  js += "\";window.SUPABASE_ANON_KEY=\"";
-  js += jsonEscape(String(SUPABASE_API_KEY));
-  js += "\";";
-  server.send(200, "application/javascript", js);
-}
-
-void handleRoot() {
-  server.sendHeader("Cache-Control", "no-store");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "0");
-  server.send_P(200, "text/html", INDEX_HTML);
-}
-
 void handleStatus() {
   server.handleClient();
   yield();
@@ -2522,6 +2561,11 @@ void handleSetSpeaker() {
   server.send(204);
 }
 
+void handleStaIp() {
+  String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("");
+  server.send(200, "text/plain", ip);
+}
+
 void handleDisconnect() {
   preferences.begin("wifi", false);
   preferences.remove("ssid");
@@ -2834,8 +2878,7 @@ void setup() {
   logNetworkInfo("Boot");
   connectToWiFi();
 
-  server.on("/", handleRoot);
-  server.on("/config.js", handleConfigJs);
+  // Web UI routes removed - Flutter app is the only frontend
   server.on("/save", handleNetworkConnection);
   server.on("/scan", handleScanNetworks);
   server.on("/status", handleStatus);
@@ -2844,6 +2887,7 @@ void setup() {
   server.on("/toggleSpeaker", handleToggleSpeaker);
   server.on("/setSpeaker", handleSetSpeaker);
   server.on("/disconnect", handleDisconnect);
+  server.on("/sta_ip", handleStaIp);
   server.on("/playTest001", handlePlayTest001);
   server.on("/playTest002", handlePlayTest002);
   server.on("/playTest003", handlePlayTest003);
@@ -3133,10 +3177,13 @@ void loop() {
   }
 
   if (now - lastDbBulkUploadMs >= dbBulkUploadIntervalMs) {
-    if (tryBulkUploadDbSeries(now)) {
+    bool uploaded = tryBulkUploadDbSeries(now);
+    if (uploaded) {
       lastDbBulkUploadMs = now;
+    } else if (sdReady() && wifiConnected && internetOk && supabaseConfigured()) {
+      // Had data/network but upload failed — retry sooner than the full interval.
+      lastDbBulkUploadMs = now - dbBulkUploadIntervalMs + 60000UL;
     } else {
-      // Avoid tight retry loops
       lastDbBulkUploadMs = now;
     }
   }
