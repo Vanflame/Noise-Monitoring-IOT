@@ -1,4 +1,4 @@
-:root { --bg: #fbfaf6; --card: #fff; --text: #1d2a3a; --muted: #5d6b7c; --line: #e8e4d8; --brand: #2f6bff; --green: #23c26b; --yellow: #ffc233; --red: #ff4d4f; --tint: #eef4ff; --f-head: "Fredoka", system-ui, sans-serif; --f-body: "Nunito", system-ui, sans-serif; }
+:root { --cf-section:#eef4ff;--cf-text:#1d2a3a;--cf-muted:#5d6b7c;--cf-card:#fff;--cf-input:#fbfaf6;--cf-line:#e8e4d8;--cf-accent:#2f6bff;--cf-on-accent:#fff;--cf-radius:22px;--cf-font-head:"Fredoka",sans-serif; --bg: #fbfaf6; --card: #fff; --text: #1d2a3a; --muted: #5d6b7c; --line: #e8e4d8; --brand: #2f6bff; --green: #23c26b; --yellow: #ffc233; --red: #ff4d4f; --tint: #eef4ff; --f-head: "Fredoka", system-ui, sans-serif; --f-body: "Nunito", system-ui, sans-serif; }
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 400 17px/1.6 var(--f-body); -webkit-font-smoothing: antialiased; overflow-x: hidden; }

@@ -1,3 +1,4 @@
+import ContactForm from "./ContactForm";
 import Meter from "./Meter";
 import Icon from "./Icon";
 
@@ -26,7 +27,7 @@ export default function Page() {
     <main>
       <nav className="nav wrap">
         <a className="brand" href="#"><span className="brand__dots"><i /><i /><i /></span>hush</a>
-        <div className="nav__links"><a href="#how">How it works</a><a href="#privacy">Privacy</a><a className="btn btn--sm" href={REPO}>Source code</a></div>
+        <div className="nav__links"><a href="#how">How it works</a><a href="#privacy">Privacy</a><a href="#contact">Contact</a><a className="btn btn--sm" href={REPO}>Source code</a></div>
       </nav>
 
       <header className="hero wrap">
@@ -70,6 +71,8 @@ export default function Page() {
         <p className="lede center">Firmware, web UI and setup notes are all in the repository.</p>
         <a className="btn" href={REPO}>Get the source</a>
       </section>
+
+      <ContactForm source="Hush (noise monitor)" title="Bring Hush to your school" lede="Interested in deploying it in your classrooms, or want a custom IoT device built? Let’s talk." interests={["Deploy Hush in our school", "Custom IoT device", "Research / capstone help", "Something else"]} />
 
       <footer className="foot wrap"><span>hush · IoT classroom noise monitoring</span><span>Built by Vanflame</span></footer>
     </main>
